@@ -7,7 +7,14 @@ const XLSX = require('xlsx');
 const cors = require('cors');
 
 const app = express();
-app.use(cors({ origin: process.env.FRONTEND_URL || '*' }));
+// Accept requests from any origin — auth is enforced by JWT, not by origin
+app.use(cors({
+  origin: true,          // reflect any requesting origin
+  credentials: true,
+  methods: ['GET','POST','PATCH','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+}));
+app.options('*', cors()); // handle preflight for all routes
 app.use(express.json({ limit: '100mb' }));
 
 const db = new Pool({
@@ -31,7 +38,14 @@ const auth = (roles = []) => (req, res, next) => {
 };
 
 // ── Health check ───────────────────────────────────────────────────────────────
-app.get('/health', (_, res) => res.json({ ok: true }));
+app.get('/health', (_, res) => res.json({
+  ok: true,
+  time: new Date().toISOString(),
+  env: {
+    db: !!process.env.DATABASE_URL,
+    jwt: !!process.env.JWT_SECRET,
+  }
+}));
 
 // ── Auth ───────────────────────────────────────────────────────────────────────
 app.post('/api/login', async (req, res) => {
