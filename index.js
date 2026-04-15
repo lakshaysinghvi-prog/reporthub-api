@@ -162,11 +162,19 @@ app.delete('/api/reports/:id', auth(['admin']), async (req, res) => {
 
 app.patch('/api/reports/:id/publish', auth(['admin']), async (req, res) => {
   try {
-    const { rows } = await db.query('SELECT id FROM rh_reports WHERE id=$1', [req.params.id]);
+    const { rows } = await db.query('SELECT id, is_published FROM rh_reports WHERE id=$1', [req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Report not found' });
-    // Unpublish all, then publish this one
-    await db.query('UPDATE rh_reports SET is_published=false');
-    await db.query('UPDATE rh_reports SET is_published=true WHERE id=$1', [req.params.id]);
+    // Toggle: if already published, unpublish; otherwise publish
+    const newState = !rows[0].is_published;
+    await db.query('UPDATE rh_reports SET is_published=$1 WHERE id=$2', [newState, req.params.id]);
+    res.json({ ok: true, is_published: newState });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Unpublish a specific report
+app.patch('/api/reports/:id/unpublish', auth(['admin']), async (req, res) => {
+  try {
+    await db.query('UPDATE rh_reports SET is_published=false WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
