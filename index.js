@@ -40,6 +40,7 @@ const auth = (roles = []) => (req, res, next) => {
 // ── Health check ───────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({
   ok: true,
+  version: "2.0",          // bump this to confirm Railway has the latest code
   time: new Date().toISOString(),
   env: {
     db: !!process.env.DATABASE_URL,
