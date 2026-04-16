@@ -236,5 +236,81 @@ app.post('/api/reports/:id/refresh-url', auth(['admin']), async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Proxy URL fetch — downloads Excel/CSV from any URL server-side ─────────────
+// Used for OneDrive, SharePoint, Dropbox, etc. that block browser CORS fetches
+app.post('/api/fetch-url', auth(['admin']), async (req, res) => {
+  try {
+    const { url, sheetName } = req.body;
+    if (!url) return res.status(400).json({ error: 'url is required' });
+
+    // Convert OneDrive share links to direct download URLs
+    let downloadUrl = url;
+    if (url.includes('1drv.ms') || url.includes('onedrive.live.com') || url.includes('sharepoint.com')) {
+      // OneDrive/SharePoint: append ?download=1 or replace embed with download
+      if (url.includes('?')) {
+        downloadUrl = url.replace(/[?&]e=[^&]*/, '') + '&download=1';
+      } else {
+        downloadUrl = url + '?download=1';
+      }
+      // For SharePoint direct links, use the raw download form
+      downloadUrl = downloadUrl.replace('/view.aspx', '/download.aspx')
+                               .replace('embed?', 'download?');
+    } else if (url.includes('dropbox.com')) {
+      // Dropbox: replace dl=0 with dl=1
+      downloadUrl = url.replace('dl=0', 'dl=1').replace('?dl=', '?dl=1').replace(/\?$/, '?dl=1');
+      if (!downloadUrl.includes('dl=1')) downloadUrl += (downloadUrl.includes('?') ? '&' : '?') + 'dl=1';
+    } else if (url.includes('drive.google.com')) {
+      // Google Drive: convert share link to direct download
+      const idMatch = url.match(/\/d\/([a-zA-Z0-9_-]+)/);
+      if (idMatch) downloadUrl = `https://drive.google.com/uc?export=download&id=${idMatch[1]}`;
+    }
+
+    const resp = await fetch(downloadUrl, {
+      headers: { 'User-Agent': 'ReportHub/1.0' },
+      redirect: 'follow',
+    });
+    if (!resp.ok) return res.status(400).json({
+      error: `Download failed: HTTP ${resp.status}. Try sharing the file with "Anyone with the link can view" and use a direct download link.`
+    });
+
+    const contentType = resp.headers.get('content-type') || '';
+    const buf = await resp.arrayBuffer();
+
+    let rows, sheetNames;
+
+    if (contentType.includes('csv') || url.endsWith('.csv')) {
+      // CSV via PapaParse-equivalent manual parse
+      const text = Buffer.from(buf).toString('utf-8');
+      const lines = text.split('\n').filter(l => l.trim());
+      if (!lines.length) return res.status(400).json({ error: 'Empty file' });
+      const headers = lines[0].split(',').map(h => h.replace(/^"|"$/g, '').trim());
+      rows = lines.slice(1).map(line => {
+        const vals = line.split(',');
+        const obj = {};
+        headers.forEach((h, i) => { obj[h] = vals[i]?.replace(/^"|"$/g, '').trim() || ''; });
+        return obj;
+      });
+      sheetNames = ['Sheet1'];
+    } else {
+      // Excel via XLSX
+      const wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
+      sheetNames = wb.SheetNames;
+      const wsName = sheetName && wb.SheetNames.includes(sheetName) ? sheetName : wb.SheetNames[0];
+      const ws = wb.Sheets[wsName];
+      if (!ws) return res.status(400).json({ error: `Sheet "${wsName}" not found. Available: ${sheetNames.join(', ')}` });
+      // Cap rows
+      if (ws['!ref']) {
+        const r = XLSX.utils.decode_range(ws['!ref']);
+        if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX.utils.encode_range(r); }
+      }
+      rows = XLSX.utils.sheet_to_json(ws, { defval: null, cellDates: true });
+    }
+
+    res.json({ ok: true, rows, sheetNames, rowCount: rows.length });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`ReportHub API running on port ${PORT}`));
