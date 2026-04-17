@@ -312,8 +312,7 @@ app.post('/api/fetch-url', auth(['admin']), async (req, res) => {
 
     if (contentType.includes('csv') || url.endsWith('.csv') || url.endsWith('.txt')) {
       const text = Buffer.from(buf).toString('utf-8');
-      const csvLines = text.split(/?
-/).filter(l => l.trim());
+      const csvLines = text.split(/\r?\n/).filter(l => l.trim());
       if (!csvLines.length) return res.status(400).json({ error: 'File appears to be empty.' });
       // Simple CSV parse
       const parseCSVLine = l => l.split(',').map(v => v.replace(/^"|"$/g, '').trim());
