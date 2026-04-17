@@ -244,20 +244,50 @@ app.post('/api/fetch-url', auth(['admin']), async (req, res) => {
 
     let downloadUrl = url.trim();
 
-    // ── OneDrive personal (1drv.ms short links) ──────────────────────────────
-    if (downloadUrl.includes('1drv.ms')) {
-      // Follow the redirect first to get the real URL
-      const r0 = await fetch(downloadUrl, { method: 'HEAD', redirect: 'follow' });
-      downloadUrl = r0.url || downloadUrl;
-    }
-
-    // ── OneDrive / SharePoint "sharing" links ─────────────────────────────────
-    if (downloadUrl.includes('onedrive.live.com') || downloadUrl.includes('sharepoint.com') ||
-        downloadUrl.includes('my.sharepoint.com') || downloadUrl.includes('1drv.ms')) {
-      // Strip existing query params and add download=1
-      const u = new URL(downloadUrl);
-      u.searchParams.set('download', '1');
-      downloadUrl = u.toString();
+    // ── OneDrive / SharePoint — use the Sharing API for reliable download ───────
+    // Works for personal OneDrive (1drv.ms), OneDrive for Business, SharePoint
+    // Even "anyone can edit/view" links work without sign-in via this method
+    if (downloadUrl.includes('1drv.ms') || downloadUrl.includes('onedrive.live.com') ||
+        downloadUrl.includes('sharepoint.com') || downloadUrl.includes('my.sharepoint.com')) {
+      try {
+        // Encode share URL as base64url (OneDrive Sharing API spec)
+        const encoded = Buffer.from(downloadUrl).toString('base64')
+          .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+        const apiUrl = `https://api.onedrive.com/v1.0/shares/u!${encoded}/root/content`;
+        console.log('Using OneDrive API:', apiUrl);
+        const r0 = await fetch(apiUrl, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ReportHub/2.0)' },
+          redirect: 'follow',
+        });
+        if (r0.ok) {
+          // Success — use this response directly
+          const ct = r0.headers.get('content-type') || '';
+          const buf0 = await r0.arrayBuffer();
+          let wb;
+          try { wb = XLSX.read(buf0, { type: 'buffer', cellDates: true }); }
+          catch(e) { return res.status(400).json({ error: 'Could not parse file: '+e.message }); }
+          const sheetNames0 = wb.SheetNames;
+          const wsName0 = sheetName && wb.SheetNames.includes(sheetName) ? sheetName : wb.SheetNames[0];
+          const ws0 = wb.Sheets[wsName0];
+          if (!ws0) return res.status(400).json({ error: `Sheet not found. Available: ${sheetNames0.join(', ')}` });
+          if (ws0['!ref']) {
+            const rr = XLSX.utils.decode_range(ws0['!ref']);
+            if (rr.e.r > 100000) { rr.e.r = 100000; ws0['!ref'] = XLSX.utils.encode_range(rr); }
+          }
+          const rows0 = XLSX.utils.sheet_to_json(ws0, { defval: null, cellDates: true });
+          return res.json({ ok: true, rows: rows0, sheetNames: sheetNames0, rowCount: rows0.length });
+        }
+        // If API fails, fall through to direct download attempt
+        console.log('OneDrive API returned', r0.status, '— trying direct download');
+      } catch(e) {
+        console.log('OneDrive API error:', e.message, '— trying direct download');
+      }
+      // Fallback: try appending download=1
+      try {
+        const u = new URL(downloadUrl);
+        u.searchParams.set('download', '1');
+        downloadUrl = u.toString();
+      } catch(e) { /* url parse failed, use as-is */ }
     }
 
     // ── Dropbox ───────────────────────────────────────────────────────────────
