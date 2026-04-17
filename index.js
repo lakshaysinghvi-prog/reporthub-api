@@ -237,68 +237,108 @@ app.post('/api/reports/:id/refresh-url', auth(['admin']), async (req, res) => {
 });
 
 // ── Proxy URL fetch — downloads Excel/CSV from any URL server-side ─────────────
-// Used for OneDrive, SharePoint, Dropbox, etc. that block browser CORS fetches
 app.post('/api/fetch-url', auth(['admin']), async (req, res) => {
   try {
     const { url, sheetName } = req.body;
     if (!url) return res.status(400).json({ error: 'url is required' });
 
-    // Convert OneDrive share links to direct download URLs
-    let downloadUrl = url;
-    if (url.includes('1drv.ms') || url.includes('onedrive.live.com') || url.includes('sharepoint.com')) {
-      // OneDrive/SharePoint: append ?download=1 or replace embed with download
-      if (url.includes('?')) {
-        downloadUrl = url.replace(/[?&]e=[^&]*/, '') + '&download=1';
-      } else {
-        downloadUrl = url + '?download=1';
-      }
-      // For SharePoint direct links, use the raw download form
-      downloadUrl = downloadUrl.replace('/view.aspx', '/download.aspx')
-                               .replace('embed?', 'download?');
-    } else if (url.includes('dropbox.com')) {
-      // Dropbox: replace dl=0 with dl=1
-      downloadUrl = url.replace('dl=0', 'dl=1').replace('?dl=', '?dl=1').replace(/\?$/, '?dl=1');
-      if (!downloadUrl.includes('dl=1')) downloadUrl += (downloadUrl.includes('?') ? '&' : '?') + 'dl=1';
-    } else if (url.includes('drive.google.com')) {
-      // Google Drive: convert share link to direct download
-      const idMatch = url.match(/\/d\/([a-zA-Z0-9_-]+)/);
-      if (idMatch) downloadUrl = `https://drive.google.com/uc?export=download&id=${idMatch[1]}`;
+    let downloadUrl = url.trim();
+
+    // ── OneDrive personal (1drv.ms short links) ──────────────────────────────
+    if (downloadUrl.includes('1drv.ms')) {
+      // Follow the redirect first to get the real URL
+      const r0 = await fetch(downloadUrl, { method: 'HEAD', redirect: 'follow' });
+      downloadUrl = r0.url || downloadUrl;
     }
 
+    // ── OneDrive / SharePoint "sharing" links ─────────────────────────────────
+    if (downloadUrl.includes('onedrive.live.com') || downloadUrl.includes('sharepoint.com') ||
+        downloadUrl.includes('my.sharepoint.com') || downloadUrl.includes('1drv.ms')) {
+      // Strip existing query params and add download=1
+      const u = new URL(downloadUrl);
+      u.searchParams.set('download', '1');
+      downloadUrl = u.toString();
+    }
+
+    // ── Dropbox ───────────────────────────────────────────────────────────────
+    if (downloadUrl.includes('dropbox.com')) {
+      const u = new URL(downloadUrl);
+      u.searchParams.set('dl', '1');
+      downloadUrl = u.toString();
+    }
+
+    // ── Google Drive share link ───────────────────────────────────────────────
+    if (downloadUrl.includes('drive.google.com')) {
+      const idMatch = downloadUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
+      if (idMatch) {
+        downloadUrl = `https://drive.google.com/uc?export=download&id=${idMatch[1]}&confirm=t`;
+      }
+    }
+
+    console.log('Fetching:', downloadUrl);
+
     const resp = await fetch(downloadUrl, {
-      headers: { 'User-Agent': 'ReportHub/1.0' },
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; ReportHub/2.0)',
+        'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/octet-stream,*/*',
+      },
       redirect: 'follow',
     });
-    if (!resp.ok) return res.status(400).json({
-      error: `Download failed: HTTP ${resp.status}. Try sharing the file with "Anyone with the link can view" and use a direct download link.`
-    });
+
+    if (!resp.ok) {
+      return res.status(400).json({
+        error: `Download failed: HTTP ${resp.status}. Make sure the file is shared as "Anyone with the link can view".`,
+        tip: resp.status === 401 || resp.status === 403
+          ? 'The file requires authentication. Share it publicly (Anyone with the link → View).'
+          : `HTTP ${resp.status} — check that the link is correct and the file is publicly shared.`
+      });
+    }
 
     const contentType = resp.headers.get('content-type') || '';
     const buf = await resp.arrayBuffer();
 
+    // Detect if we got an HTML page instead of a file (common with auth redirects)
+    if (contentType.includes('text/html')) {
+      const preview = Buffer.from(buf).toString('utf-8', 0, 500);
+      if (preview.includes('<html') || preview.includes('<!DOCTYPE')) {
+        return res.status(400).json({
+          error: 'Got a login/preview page instead of the file. The file needs to be shared as "Anyone with the link can view" without requiring sign-in.',
+          tip: 'OneDrive: open file → Share → Change to "Anyone with the link can view" → Copy link. Make sure it says "No sign-in required".'
+        });
+      }
+    }
+
     let rows, sheetNames;
 
-    if (contentType.includes('csv') || url.endsWith('.csv')) {
-      // CSV via PapaParse-equivalent manual parse
+    if (contentType.includes('csv') || url.endsWith('.csv') || url.endsWith('.txt')) {
       const text = Buffer.from(buf).toString('utf-8');
-      const lines = text.split('\n').filter(l => l.trim());
-      if (!lines.length) return res.status(400).json({ error: 'Empty file' });
-      const headers = lines[0].split(',').map(h => h.replace(/^"|"$/g, '').trim());
-      rows = lines.slice(1).map(line => {
-        const vals = line.split(',');
+      const csvLines = text.split(/?
+/).filter(l => l.trim());
+      if (!csvLines.length) return res.status(400).json({ error: 'File appears to be empty.' });
+      // Simple CSV parse
+      const parseCSVLine = l => l.split(',').map(v => v.replace(/^"|"$/g, '').trim());
+      const headers = parseCSVLine(csvLines[0]);
+      rows = csvLines.slice(1).map(line => {
+        const vals = parseCSVLine(line);
         const obj = {};
-        headers.forEach((h, i) => { obj[h] = vals[i]?.replace(/^"|"$/g, '').trim() || ''; });
+        headers.forEach((h, i) => { if (h) obj[h] = vals[i] || ''; });
         return obj;
       });
-      sheetNames = ['Sheet1'];
+      sheetNames = ['CSV'];
     } else {
-      // Excel via XLSX
-      const wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
+      let wb;
+      try {
+        wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
+      } catch (xlsxErr) {
+        return res.status(400).json({
+          error: 'Could not parse the downloaded file as Excel. ' + xlsxErr.message,
+          tip: 'Make sure the link points to an .xlsx, .xls, or .csv file, not a preview page.'
+        });
+      }
       sheetNames = wb.SheetNames;
       const wsName = sheetName && wb.SheetNames.includes(sheetName) ? sheetName : wb.SheetNames[0];
       const ws = wb.Sheets[wsName];
       if (!ws) return res.status(400).json({ error: `Sheet "${wsName}" not found. Available: ${sheetNames.join(', ')}` });
-      // Cap rows
       if (ws['!ref']) {
         const r = XLSX.utils.decode_range(ws['!ref']);
         if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX.utils.encode_range(r); }
@@ -308,6 +348,7 @@ app.post('/api/fetch-url', auth(['admin']), async (req, res) => {
 
     res.json({ ok: true, rows, sheetNames, rowCount: rows.length });
   } catch (e) {
+    console.error('fetch-url error:', e);
     res.status(500).json({ error: e.message });
   }
 });
