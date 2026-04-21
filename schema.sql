@@ -57,3 +57,18 @@ ON CONFLICT (username) DO NOTHING;
 -- ── Verify setup ─────────────────────────────────────────────────────────────
 SELECT 'Tables created successfully' as status;
 SELECT username, role, created_at FROM rh_users;
+
+-- ── OAuth tokens (for Microsoft Graph + Google Drive API access) ─────────────
+CREATE TABLE IF NOT EXISTS rh_oauth_tokens (
+  id           BIGSERIAL PRIMARY KEY,
+  user_id      UUID REFERENCES rh_users(id) ON DELETE CASCADE,
+  provider     TEXT NOT NULL CHECK (provider IN ('microsoft','google')),
+  access_token TEXT NOT NULL,
+  refresh_token TEXT,
+  expires_at   TIMESTAMPTZ,
+  token_data   JSONB DEFAULT '{}',
+  created_at   TIMESTAMPTZ DEFAULT now(),
+  updated_at   TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (user_id, provider)
+);
+CREATE INDEX IF NOT EXISTS idx_rh_oauth_user ON rh_oauth_tokens(user_id);
