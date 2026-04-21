@@ -304,10 +304,15 @@ function parseXlsxBuffer(buf, sheetName) {
 }
 
 // ── Main fetch-url endpoint ─────────────────────────────────────────────────────
-app.post('/api/fetch-url', auth(['admin']), async (req, res) => {
+app.post('/api/fetch-url', auth(['admin','user']), async (req, res) => {
   const { url, sheetName } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
-  const userId = req.user.id;
+  // For viewer role, use the admin's stored OAuth tokens
+  let userId = req.user.id;
+  if (req.user.role !== 'admin') {
+    const adminRow = await db.query("SELECT id FROM rh_users WHERE role='admin' LIMIT 1");
+    if (adminRow.rows[0]) userId = adminRow.rows[0].id;
+  }
   const isMicrosoft = url.includes('sharepoint.com') || url.includes('onedrive.live.com') || url.includes('1drv.ms') || url.includes('office.com');
   const isGoogle = url.includes('drive.google.com') || url.includes('docs.google.com');
 
@@ -582,7 +587,7 @@ app.post('/api/reports/:id/refresh-url', auth(['admin']), async (req, res) => {
 });
 
 // ── Proxy URL fetch — downloads Excel/CSV from any URL server-side ─────────────
-app.post('/api/fetch-url', auth(['admin']), async (req, res) => {
+app.post('/api/fetch-url', auth(['admin','user']), async (req, res) => {
   try {
     const { url, sheetName } = req.body;
     if (!url) return res.status(400).json({ error: 'url is required' });
