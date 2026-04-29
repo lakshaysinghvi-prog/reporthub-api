@@ -416,12 +416,12 @@ app.post('/api/login', async (req, res) => {
 });
 
 // ── Users (admin only) ────────────────────────────────────────────────────────
-app.get('/api/users', auth(['admin']), async (req, res) => {
+app.get('/api/users', auth(['admin','subadmin']), async (req, res) => {
   const { rows } = await db.query("SELECT id, username, role FROM rh_users ORDER BY username");
   res.json(rows);
 });
 
-app.post('/api/users', auth(['admin']), async (req, res) => {
+app.post('/api/users', auth(['admin','subadmin']), async (req, res) => {
   try {
     const { username, password, role } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
@@ -435,6 +435,26 @@ app.post('/api/users', auth(['admin']), async (req, res) => {
     if (e.code === '23505') return res.status(400).json({ error: 'Username already exists' });
     res.status(500).json({ error: e.message });
   }
+});
+
+app.patch('/api/users/:id/role', auth(['admin']), async (req, res) => {
+  try {
+    const { role } = req.body;
+    if (!['admin','subadmin','user'].includes(role))
+      return res.status(400).json({ error: 'Invalid role' });
+    // Never demote the last admin
+    if (role !== 'admin') {
+      const { rows: admins } = await db.query("SELECT id FROM rh_users WHERE role='admin'");
+      if (admins.length === 1 && admins[0].id === req.params.id)
+        return res.status(400).json({ error: 'Cannot demote the last super admin' });
+    }
+    const { rows } = await db.query(
+      'UPDATE rh_users SET role=$1 WHERE id=$2 RETURNING id,username,role',
+      [role, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.patch('/api/users/:id/password', auth(['admin']), async (req, res) => {
@@ -456,17 +476,122 @@ app.delete('/api/users/:id', auth(['admin']), async (req, res) => {
 });
 
 // ── Reports ───────────────────────────────────────────────────────────────────
+// ── Public: published reports list (no auth — for mobile/shared link access) ────
+app.get('/api/public/reports', async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, name, config, card_fields,
+         (SELECT COUNT(*) FROM rh_rows WHERE report_id=r.id) AS row_count
+       FROM rh_reports r WHERE is_published=true ORDER BY updated_at DESC`
+    );
+    res.json(rows.map(r => ({
+      id: r.id, name: r.name, isPublished: true,
+      rows: parseInt(r.row_count) || 0,
+      config: typeof r.config === 'string' ? JSON.parse(r.config) : (r.config || {}),
+      cardFields: r.card_fields ? (typeof r.card_fields === 'string' ? JSON.parse(r.card_fields) : r.card_fields) : [],
+    })));
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Public: rows for a published report (no auth) ───────────────────────────────
+app.get('/api/public/reports/:id/data', async (req, res) => {
+  try {
+    const { rows: rpts } = await db.query(
+      'SELECT is_published FROM rh_reports WHERE id=$1', [req.params.id]);
+    if (!rpts[0] || !rpts[0].is_published)
+      return res.status(403).json({ error: 'Report not found or not published' });
+    const { rows } = await db.query(
+      'SELECT data FROM rh_rows WHERE report_id=$1 ORDER BY id', [req.params.id]);
+    const allRows = rows.map(r => typeof r.data === 'string' ? JSON.parse(r.data) : r.data);
+    const fields = allRows.length ? Object.keys(allRows[0]) : [];
+    const numFields = fields.filter(f => typeof allRows[0]?.[f] === 'number');
+    res.json({ rows: allRows, fields, numFields });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 app.get('/api/reports', auth([]), async (req, res) => {
   try {
-    const q = req.user.role === 'admin'
-      ? 'SELECT id, name, config, card_fields, is_published, row_count, field_count, created_at FROM rh_reports ORDER BY created_at DESC'
-      : 'SELECT id, name, config, card_fields, is_published, row_count, field_count, created_at FROM rh_reports WHERE is_published=true ORDER BY created_at DESC';
-    const { rows } = await db.query(q);
+    const role = req.user.role;
+    const userId = req.user.id;
+    let q, params = [];
+
+    if (role === 'admin') {
+      // Super admin: see ALL reports
+      q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
+             r.row_count, r.field_count, r.created_at, r.created_by
+           FROM rh_reports r ORDER BY r.created_at DESC`;
+    } else if (role === 'subadmin') {
+      // Sub-admin: see only their own reports
+      q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
+             r.row_count, r.field_count, r.created_at, r.created_by
+           FROM rh_reports r WHERE r.created_by=$1 ORDER BY r.created_at DESC`;
+      params = [userId];
+    } else {
+      // User: see only published reports explicitly assigned to them
+      // (if a report has NO access rows, it is NOT visible to regular users unless assigned)
+      q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
+             r.row_count, r.field_count, r.created_at
+           FROM rh_reports r
+           INNER JOIN rh_report_access ra ON ra.report_id = r.id
+           WHERE r.is_published = true AND ra.user_id = $1
+           ORDER BY r.created_at DESC`;
+      params = [userId];
+    }
+
+    const { rows } = await db.query(q, params);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-app.post('/api/reports', auth(['admin']), async (req, res) => {
+// ── Report access management ───────────────────────────────────────────────────
+// Get users who have access to a specific report
+app.get('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
+  try {
+    // Subadmin can only manage their own reports
+    if (req.user.role === 'subadmin') {
+      const { rows: rpt } = await db.query(
+        'SELECT created_by FROM rh_reports WHERE id=$1', [req.params.id]);
+      if (!rpt[0] || rpt[0].created_by !== req.user.id)
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    const { rows } = await db.query(
+      `SELECT u.id, u.username, u.role,
+         CASE WHEN ra.user_id IS NOT NULL THEN true ELSE false END as has_access
+       FROM rh_users u
+       LEFT JOIN rh_report_access ra ON ra.report_id=$1 AND ra.user_id=u.id
+       WHERE u.role='user'
+       ORDER BY u.username`, [req.params.id]);
+    res.json(rows);
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Set report access (replace all users for this report)
+app.put('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
+  const client = await db.connect();
+  try {
+    if (req.user.role === 'subadmin') {
+      const { rows: rpt } = await db.query(
+        'SELECT created_by FROM rh_reports WHERE id=$1', [req.params.id]);
+      if (!rpt[0] || rpt[0].created_by !== req.user.id)
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    const { userIds } = req.body; // array of user UUIDs
+    await client.query('BEGIN');
+    await client.query('DELETE FROM rh_report_access WHERE report_id=$1', [req.params.id]);
+    for (const uid of (userIds || [])) {
+      await client.query(
+        'INSERT INTO rh_report_access(report_id, user_id) VALUES($1,$2) ON CONFLICT DO NOTHING',
+        [req.params.id, uid]);
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, count: userIds?.length || 0 });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
+});
+
+app.post('/api/reports', auth(['admin','subadmin']), async (req, res) => {
   const client = await db.connect();
   try {
     const { name, config, cardFields, rows, fields, numFields } = req.body;
@@ -504,15 +629,56 @@ app.post('/api/reports', auth(['admin']), async (req, res) => {
   } finally { client.release(); }
 });
 
-app.delete('/api/reports/:id', auth(['admin']), async (req, res) => {
+// Helper: ensure requester owns this report or is super admin
+async function assertReportOwner(req, res) {
+  if (req.user.role === 'admin') return true;
+  const { rows } = await db.query('SELECT created_by FROM rh_reports WHERE id=$1', [req.params.id]);
+  if (!rows[0]) { res.status(404).json({ error: 'Report not found' }); return false; }
+  if (rows[0].created_by !== req.user.id) { res.status(403).json({ error: 'Not your report' }); return false; }
+  return true;
+}
+
+app.delete('/api/reports/:id', auth(['admin','subadmin']), async (req, res) => {
+  if (!await assertReportOwner(req, res)) return;
   try {
     await db.query('DELETE FROM rh_reports WHERE id=$1', [req.params.id]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Report access management ─────────────────────────────────────────────────────
+app.get('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
+  if (!await assertReportOwner(req, res)) return;
+  try {
+    const { rows } = await db.query(
+      `SELECT u.id, u.username, u.role,
+         EXISTS(SELECT 1 FROM rh_report_access ra WHERE ra.report_id=$1 AND ra.user_id=u.id) AS has_access
+       FROM rh_users u WHERE u.role='user' ORDER BY u.username`,
+      [req.params.id]
+    );
+    const { rows: acRows } = await db.query(
+      'SELECT COUNT(*) FROM rh_report_access WHERE report_id=$1', [req.params.id]);
+    res.json({ users: rows, isRestricted: parseInt(acRows[0].count) > 0 });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+app.put('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
+  if (!await assertReportOwner(req, res)) return;
+  try {
+    const { userIds } = req.body;
+    await db.query('DELETE FROM rh_report_access WHERE report_id=$1', [req.params.id]);
+    if (userIds && userIds.length > 0) {
+      const vals = userIds.map((uid, i) => `($1,$${i+2})`).join(',');
+      await db.query(`INSERT INTO rh_report_access(report_id,user_id) VALUES ${vals}`,
+        [req.params.id, ...userIds]);
+    }
+    res.json({ ok: true, restricted: !!(userIds && userIds.length > 0) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // Publish — always sets published=true, never touches other reports
-app.patch('/api/reports/:id/publish', auth(['admin']), async (req, res) => {
+app.patch('/api/reports/:id/publish', auth(['admin','subadmin']), async (req, res) => {
+  if (!await assertReportOwner(req, res)) return;
   try {
     await db.query('UPDATE rh_reports SET is_published=true WHERE id=$1', [req.params.id]);
     res.json({ ok: true, is_published: true });
@@ -520,7 +686,8 @@ app.patch('/api/reports/:id/publish', auth(['admin']), async (req, res) => {
 });
 
 // Unpublish — always sets published=false
-app.patch('/api/reports/:id/unpublish', auth(['admin']), async (req, res) => {
+app.patch('/api/reports/:id/unpublish', auth(['admin','subadmin']), async (req, res) => {
+  if (!await assertReportOwner(req, res)) return;
   try {
     await db.query('UPDATE rh_reports SET is_published=false WHERE id=$1', [req.params.id]);
     res.json({ ok: true, is_published: false });
