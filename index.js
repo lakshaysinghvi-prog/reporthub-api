@@ -667,7 +667,7 @@ app.put('/api/reports/:id', auth(['admin','subadmin']), async (req, res) => {
       );
     }
     await client.query('COMMIT');
-    res.json({ id: parseInt(req.params.id) });
+    res.json({ id: req.params.id });
   } catch(e) {
     await client.query('ROLLBACK');
     res.status(500).json({ error: e.message });
