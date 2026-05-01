@@ -25,14 +25,6 @@ const auth = (roles = []) => (req, res, next) => {
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
 
-// ── DB migration: add status column if missing ─────────────────────────────────
-(async () => {
-  try {
-    await db.query(`ALTER TABLE rh_users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'`);
-    console.log('DB migration: status column ensured');
-  } catch(e) { console.error('DB migration error:', e.message); }
-})();
-
 // ── Health ──────────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({
   ok: true, version: '3.0', time: new Date().toISOString(),
@@ -414,7 +406,6 @@ app.post('/api/login', async (req, res) => {
     if (!rows[0]) return res.status(401).json({ error: 'Invalid credentials' });
     const ok = await bcrypt.compare(password, rows[0].password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    if (rows[0].status === 'pending') return res.status(403).json({ error: 'Account pending approval by Super Admin' });
     const token = jwt.sign(
       { id: rows[0].id, username: rows[0].username, role: rows[0].role },
       process.env.JWT_SECRET,
@@ -426,7 +417,7 @@ app.post('/api/login', async (req, res) => {
 
 // ── Users (admin only) ────────────────────────────────────────────────────────
 app.get('/api/users', auth(['admin','subadmin']), async (req, res) => {
-  const { rows } = await db.query("SELECT id, username, role, status FROM rh_users ORDER BY username");
+  const { rows } = await db.query("SELECT id, username, role FROM rh_users ORDER BY username");
   res.json(rows);
 });
 
@@ -435,11 +426,9 @@ app.post('/api/users', auth(['admin','subadmin']), async (req, res) => {
     const { username, password, role } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
     const hash = await bcrypt.hash(password, 10);
-    // Subadmins create users in 'pending' status — requires superadmin approval before login
-    const status = req.user.role === 'admin' ? 'active' : 'pending';
     const { rows } = await db.query(
-      'INSERT INTO rh_users(username, password_hash, role, status) VALUES($1,$2,$3,$4) RETURNING id, username, role, status',
-      [username.trim(), hash, role || 'user', status]
+      'INSERT INTO rh_users(username, password_hash, role) VALUES($1,$2,$3) RETURNING id, username, role',
+      [username.trim(), hash, role || 'user']
     );
     res.json(rows[0]);
   } catch (e) {
@@ -466,13 +455,6 @@ app.patch('/api/users/:id/role', auth(['admin']), async (req, res) => {
     if (!rows[0]) return res.status(404).json({ error: 'User not found' });
     res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.patch('/api/users/:id/approve', auth(['admin']), async (req, res) => {
-  try {
-    await db.query("UPDATE rh_users SET status='active' WHERE id=$1", [req.params.id]);
-    res.json({ ok: true });
-  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.patch('/api/users/:id/password', auth(['admin']), async (req, res) => {
@@ -577,7 +559,7 @@ app.get('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) 
          CASE WHEN ra.user_id IS NOT NULL THEN true ELSE false END as has_access
        FROM rh_users u
        LEFT JOIN rh_report_access ra ON ra.report_id=$1 AND ra.user_id=u.id
-       WHERE u.role='user' AND u.status='active'
+       WHERE u.role='user'
        ORDER BY u.username`, [req.params.id]);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -655,6 +637,42 @@ async function assertReportOwner(req, res) {
   if (rows[0].created_by !== req.user.id) { res.status(403).json({ error: 'Not your report' }); return false; }
   return true;
 }
+
+// Update report in-place (preserves is_published and rh_report_access)
+app.put('/api/reports/:id', auth(['admin','subadmin']), async (req, res) => {
+  if (!await assertReportOwner(req, res)) return;
+  const client = await db.connect();
+  try {
+    const { name, config, cardFields, rows, fields, numFields } = req.body;
+    await client.query('BEGIN');
+    // Update metadata
+    await client.query(
+      `UPDATE rh_reports SET name=$1, config=$2, card_fields=$3, num_fields=$4,
+       row_count=$5, field_count=$6 WHERE id=$7`,
+      [name, JSON.stringify(config), JSON.stringify(cardFields||[]),
+       JSON.stringify(numFields||[]), rows.length, fields.length, req.params.id]
+    );
+    // Replace dataset fields
+    await client.query('DELETE FROM rh_datasets WHERE report_id=$1', [req.params.id]);
+    await client.query('INSERT INTO rh_datasets(report_id, fields) VALUES($1,$2)',
+      [req.params.id, JSON.stringify(fields)]);
+    // Replace rows
+    await client.query('DELETE FROM rh_rows WHERE report_id=$1', [req.params.id]);
+    for (let i = 0; i < rows.length; i += 500) {
+      const batch = rows.slice(i, i + 500);
+      const values = batch.map((_, j) => `($1, $${j + 2})`).join(',');
+      await client.query(
+        `INSERT INTO rh_rows(report_id, row_data) VALUES ${values}`,
+        [req.params.id, ...batch.map(r => JSON.stringify(r))]
+      );
+    }
+    await client.query('COMMIT');
+    res.json({ id: parseInt(req.params.id) });
+  } catch(e) {
+    await client.query('ROLLBACK');
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
+});
 
 app.delete('/api/reports/:id', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
