@@ -638,6 +638,19 @@ async function assertReportOwner(req, res) {
   return true;
 }
 
+// Update report config only (no row replacement) — used for filter/layout saves
+app.patch('/api/reports/:id/config', auth(['admin','subadmin']), async (req, res) => {
+  if (!await assertReportOwner(req, res)) return;
+  try {
+    const { config, name } = req.body;
+    await db.query(
+      'UPDATE rh_reports SET config=$1' + (name ? ', name=$2 WHERE id=$3' : ' WHERE id=$2'),
+      name ? [JSON.stringify(config), name, req.params.id] : [JSON.stringify(config), req.params.id]
+    );
+    res.json({ id: req.params.id });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // Update report in-place (preserves is_published and rh_report_access)
 app.put('/api/reports/:id', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
