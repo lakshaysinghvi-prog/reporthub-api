@@ -501,8 +501,8 @@ app.get('/api/public/reports/:id/data', async (req, res) => {
     if (!rpts[0] || !rpts[0].is_published)
       return res.status(403).json({ error: 'Report not found or not published' });
     const { rows } = await db.query(
-      'SELECT data FROM rh_rows WHERE report_id=$1 ORDER BY id', [req.params.id]);
-    const allRows = rows.map(r => typeof r.data === 'string' ? JSON.parse(r.data) : r.data);
+      'SELECT row_data FROM rh_rows WHERE report_id=$1 ORDER BY id', [req.params.id]);
+    const allRows = rows.map(r => typeof r.row_data === 'string' ? JSON.parse(r.row_data) : r.row_data);
     const fields = allRows.length ? Object.keys(allRows[0]) : [];
     const numFields = fields.filter(f => typeof allRows[0]?.[f] === 'number');
     res.json({ rows: allRows, fields, numFields });
@@ -750,7 +750,7 @@ app.get('/api/reports/:id/data', auth([]), async (req, res) => {
       'SELECT is_published, num_fields FROM rh_reports WHERE id=$1', [req.params.id]
     );
     if (!rpt[0]) return res.status(404).json({ error: 'Not found' });
-    if (!rpt[0].is_published && req.user.role !== 'admin')
+    if (!rpt[0].is_published && req.user.role !== 'admin' && req.user.role !== 'subadmin')
       return res.status(403).json({ error: 'Not published' });
 
     const { rows: ds } = await db.query('SELECT fields FROM rh_datasets WHERE report_id=$1', [req.params.id]);
