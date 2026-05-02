@@ -518,13 +518,17 @@ app.get('/api/reports', auth([]), async (req, res) => {
     if (role === 'admin') {
       // Super admin: see ALL reports
       q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
-             r.row_count, r.field_count, r.created_at, r.created_by
-           FROM rh_reports r ORDER BY r.created_at DESC`;
+             r.row_count, r.field_count, r.created_at, r.created_by,
+             u.username AS created_by_username
+           FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
+           ORDER BY r.created_at DESC`;
     } else if (role === 'subadmin') {
       // Sub-admin: see only their own reports
       q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
-             r.row_count, r.field_count, r.created_at, r.created_by
-           FROM rh_reports r WHERE r.created_by=$1 ORDER BY r.created_at DESC`;
+             r.row_count, r.field_count, r.created_at, r.created_by,
+             u.username AS created_by_username
+           FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
+           WHERE r.created_by=$1 ORDER BY r.created_at DESC`;
       params = [userId];
     } else {
       // User: see only published reports explicitly assigned to them
