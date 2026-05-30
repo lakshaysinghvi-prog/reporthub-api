@@ -577,7 +577,7 @@ app.post('/api/login', async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '10h' }
     );
-    res.json({ token, role: rows[0].role, username: rows[0].username });
+    res.json({ token, role: rows[0].role, username: rows[0].username, id: rows[0].id });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
