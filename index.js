@@ -1303,12 +1303,32 @@ setInterval(runAutoRefreshJob, 60 * 1000);
 // ── Lightweight: return field names for a report (for collab setup dropdowns) ──────
 app.get('/api/reports/:id/fields', auth([]), async (req, res) => {
   try {
+    // Try rh_datasets first (fastest)
     const { rows: ds } = await db.query('SELECT fields FROM rh_datasets WHERE report_id=$1', [req.params.id]);
-    if (ds[0]?.fields) return res.json(ds[0].fields);
-    // Fallback: read first row and extract keys
+    if (ds[0]?.fields) {
+      const f = Array.isArray(ds[0].fields) ? ds[0].fields
+              : (typeof ds[0].fields === 'string' ? JSON.parse(ds[0].fields) : []);
+      if (f.length > 0) return res.json(f);
+    }
+    // Fallback: extract keys from first row in rh_rows
     const { rows: sample } = await db.query('SELECT row_data FROM rh_rows WHERE report_id=$1 LIMIT 1', [req.params.id]);
-    const fields = sample[0] ? Object.keys(sample[0].row_data) : [];
-    res.json(fields);
+    if (sample[0]) {
+      const rd = typeof sample[0].row_data === 'string' ? JSON.parse(sample[0].row_data) : sample[0].row_data;
+      return res.json(Object.keys(rd || {}));
+    }
+    // Last resort: extract field names from report config
+    const { rows: rpt } = await db.query('SELECT config FROM rh_reports WHERE id=$1', [req.params.id]);
+    if (rpt[0]) {
+      const cfg = typeof rpt[0].config === 'string' ? JSON.parse(rpt[0].config) : (rpt[0].config || {});
+      const fields = new Set();
+      const extract = (c) => {
+        ['rows','columns','values','filters'].forEach(k => (c[k]||[]).forEach(x => x.field && fields.add(x.field)));
+      };
+      if (cfg.tabs) cfg.tabs.forEach(t => extract(t.config || {}));
+      extract(cfg);
+      return res.json([...fields]);
+    }
+    res.json([]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
