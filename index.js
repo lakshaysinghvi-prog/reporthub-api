@@ -583,10 +583,12 @@ app.post('/api/login', async (req, res) => {
 
 // ── Users management ─────────────────────────────────────────────────────────
 app.get('/api/users', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  const { rows } = await db.query(
-    "SELECT id, username, role, COALESCE(status,'active') AS status FROM rh_users ORDER BY username"
-  );
-  res.json(rows);
+  try {
+    const { rows } = await db.query(
+      `SELECT id, username, role, COALESCE(status, 'active') AS status FROM rh_users ORDER BY username`
+    );
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/api/users', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
