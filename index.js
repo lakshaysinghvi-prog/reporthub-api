@@ -704,6 +704,7 @@ app.get('/api/reports', auth([]), async (req, res) => {
       // Super admin: see ALL reports
       q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
              r.row_count, r.field_count, r.created_at, r.created_by,
+             r.collab_enabled,
              u.username AS created_by_username
            FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
            ORDER BY r.created_at DESC`;
@@ -711,6 +712,7 @@ app.get('/api/reports', auth([]), async (req, res) => {
       // Sub-admin: see only their own reports
       q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
              r.row_count, r.field_count, r.created_at, r.created_by,
+             r.collab_enabled,
              u.username AS created_by_username
            FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
            WHERE r.created_by=$1 ORDER BY r.created_at DESC`;
@@ -719,6 +721,7 @@ app.get('/api/reports', auth([]), async (req, res) => {
       // SubAdmin+User: see own created reports AND published reports assigned to them
       q = `SELECT DISTINCT r.id, r.name, r.config, r.card_fields, r.is_published,
              r.row_count, r.field_count, r.created_at, r.created_by,
+             r.collab_enabled,
              u.username AS created_by_username
            FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
            WHERE r.created_by=$1
@@ -731,7 +734,7 @@ app.get('/api/reports', auth([]), async (req, res) => {
       // User: see only published reports explicitly assigned to them
       // (if a report has NO access rows, it is NOT visible to regular users unless assigned)
       q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
-             r.row_count, r.field_count, r.created_at
+             r.row_count, r.field_count, r.created_at, r.collab_enabled
            FROM rh_reports r
            INNER JOIN rh_report_access ra ON ra.report_id = r.id
            WHERE r.is_published = true AND ra.user_id = $1
@@ -1292,6 +1295,247 @@ async function runAutoRefreshJob() {
 
 // Start the auto-refresh background job (runs every 60 seconds)
 setInterval(runAutoRefreshJob, 60 * 1000);
+
+// ────────────────────────────────────────────────────────────────────────────────
+// ── PHASE 3: COLLABORATIVE WORKFLOW ─────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────────────────
+
+// ── Toggle collab mode on a report ───────────────────────────────────────────────
+app.patch('/api/reports/:id/collab-toggle', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    await db.query('UPDATE rh_reports SET collab_enabled=$1 WHERE id=$2', [!!enabled, req.params.id]);
+    res.json({ ok: true, collab_enabled: !!enabled });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Collab column definitions ─────────────────────────────────────────────────────
+// GET all collab columns for a report
+app.get('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      'SELECT * FROM rh_collab_columns WHERE report_id=$1 ORDER BY col_order',
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST create a collab column
+app.post('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order } = req.body;
+    // col_type: 'input' | 'workflow'
+    const { rows } = await db.query(`
+      INSERT INTO rh_collab_columns (report_id, label, col_type, inputter_ids, reviewer_ids, ref_column, col_order)
+      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
+    `, [req.params.id, label, col_type||'input',
+        JSON.stringify(inputter_ids||[]), JSON.stringify(reviewer_ids||[]),
+        ref_column||null, col_order||0]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT update a collab column
+app.put('/api/reports/:id/collab-columns/:colId', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order } = req.body;
+    const { rows } = await db.query(`
+      UPDATE rh_collab_columns
+      SET label=$1, col_type=$2, inputter_ids=$3, reviewer_ids=$4, ref_column=$5, col_order=$6, updated_at=now()
+      WHERE id=$7 AND report_id=$8 RETURNING *
+    `, [label, col_type||'input',
+        JSON.stringify(inputter_ids||[]), JSON.stringify(reviewer_ids||[]),
+        ref_column||null, col_order||0, req.params.colId, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Column not found' });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE a collab column
+app.delete('/api/reports/:id/collab-columns/:colId', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    await db.query('DELETE FROM rh_collab_columns WHERE id=$1 AND report_id=$2', [req.params.colId, req.params.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Cycle management ──────────────────────────────────────────────────────────────
+// GET cycles for a report
+app.get('/api/reports/:id/collab-cycles', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      'SELECT * FROM rh_collab_cycles WHERE report_id=$1 ORDER BY created_at DESC',
+      [req.params.id]
+    );
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// POST open a new cycle (only admin/subadmin; only one open at a time)
+app.post('/api/reports/:id/collab-cycles', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { period_label, history_viewer_ids } = req.body;
+    if (!period_label) return res.status(400).json({ error: 'period_label required (e.g. "May 2026")' });
+    // Close any open cycle first — don't allow two open
+    const { rows: open } = await db.query(
+      "SELECT id FROM rh_collab_cycles WHERE report_id=$1 AND status='open'", [req.params.id]
+    );
+    if (open.length) return res.status(409).json({ error: 'Another cycle is already open. Close it before opening a new one.' });
+    const { rows } = await db.query(`
+      INSERT INTO rh_collab_cycles (report_id, period_label, status, history_viewer_ids, opened_by)
+      VALUES ($1,$2,'open',$3,$4) RETURNING *
+    `, [req.params.id, period_label, JSON.stringify(history_viewer_ids||[]), req.user.id]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH close a cycle (freezes it)
+app.patch('/api/reports/:id/collab-cycles/:cycleId/close', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { rows } = await db.query(`
+      UPDATE rh_collab_cycles SET status='closed', closed_at=now(), closed_by=$1
+      WHERE id=$2 AND report_id=$3 AND status='open' RETURNING *
+    `, [req.user.id, req.params.cycleId, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Open cycle not found' });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Collab values (cell-level input/workflow) ──────────────────────────────────────
+// GET all values for a cycle
+app.get('/api/reports/:id/collab-cycles/:cycleId/values', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      'SELECT * FROM rh_collab_values WHERE cycle_id=$1 ORDER BY row_key, col_id',
+      [req.params.cycleId]
+    );
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PUT upsert a draft value (inputter saves their value — not yet submitted)
+app.put('/api/reports/:id/collab-cycles/:cycleId/values', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { row_key, col_id, value, remarks } = req.body;
+    if (row_key === undefined || col_id === undefined) return res.status(400).json({ error: 'row_key and col_id required' });
+
+    // Verify cycle is open
+    const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
+    if (!cyc[0] || cyc[0].status !== 'open') return res.status(409).json({ error: 'Cycle is closed' });
+
+    // Check column type — if 'input' just save approved straight away; if 'workflow' set pending
+    const { rows: col } = await db.query('SELECT col_type, inputter_ids FROM rh_collab_columns WHERE id=$1', [col_id]);
+    if (!col[0]) return res.status(404).json({ error: 'Column not found' });
+
+    // Verify user is an allowed inputter (or admin/subadmin)
+    const isBuilder = ['admin','subadmin','subadmin_user'].includes(req.user.role);
+    const inputterIds = Array.isArray(col[0].inputter_ids) ? col[0].inputter_ids : JSON.parse(col[0].inputter_ids||'[]');
+    if (!isBuilder && !inputterIds.includes(req.user.id)) {
+      return res.status(403).json({ error: 'You are not assigned as an inputter for this column' });
+    }
+
+    const newStatus = col[0].col_type === 'input' ? 'approved' : 'pending';
+    const { rows } = await db.query(`
+      INSERT INTO rh_collab_values (cycle_id, report_id, row_key, col_id, value, remarks, status, inputter_id, updated_at)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())
+      ON CONFLICT (cycle_id, row_key, col_id)
+      DO UPDATE SET value=$5, remarks=$6, status=
+        CASE WHEN rh_collab_values.status IN ('approved','rejected') THEN 'pending' ELSE $7 END,
+        inputter_id=$8, updated_at=now()
+      RETURNING *
+    `, [req.params.cycleId, req.params.id, String(row_key), col_id, value, remarks||null, newStatus, req.user.id]);
+    // Write audit
+    await db.query(`INSERT INTO rh_collab_audit (cycle_id, report_id, row_key, col_id, actor_id, action, value, remarks)
+      VALUES ($1,$2,$3,$4,$5,'save',$6,$7)`,
+      [req.params.cycleId, req.params.id, String(row_key), col_id, req.user.id, value, remarks||null]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH submit a row's value for review (inputter submits)
+app.patch('/api/reports/:id/collab-cycles/:cycleId/values/submit', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { row_key, col_id } = req.body;
+    const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
+    if (!cyc[0] || cyc[0].status !== 'open') return res.status(409).json({ error: 'Cycle is closed' });
+
+    const { rows } = await db.query(`
+      UPDATE rh_collab_values SET status='submitted', updated_at=now()
+      WHERE cycle_id=$1 AND row_key=$2 AND col_id=$3 AND inputter_id=$4 AND status='pending'
+      RETURNING *
+    `, [req.params.cycleId, String(row_key), col_id, req.user.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Value not found or not in pending state' });
+    await db.query(`INSERT INTO rh_collab_audit (cycle_id, report_id, row_key, col_id, actor_id, action, value, remarks)
+      VALUES ($1,$2,$3,$4,$5,'submit',$6,null)`,
+      [req.params.cycleId, req.params.id, String(row_key), col_id, req.user.id, rows[0].value]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH review a value (reviewer: approve / reject / hold)
+app.patch('/api/reports/:id/collab-cycles/:cycleId/values/review', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { row_key, col_id, action, remarks } = req.body; // action: 'approved'|'rejected'|'hold'
+    if (!['approved','rejected','hold'].includes(action)) return res.status(400).json({ error: 'action must be approved/rejected/hold' });
+
+    const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
+    if (!cyc[0] || cyc[0].status !== 'open') return res.status(409).json({ error: 'Cycle is closed' });
+
+    // Verify user is a reviewer for this column
+    const { rows: col } = await db.query('SELECT reviewer_ids FROM rh_collab_columns WHERE id=$1', [col_id]);
+    if (!col[0]) return res.status(404).json({ error: 'Column not found' });
+    const isBuilder = ['admin','subadmin'].includes(req.user.role);
+    const reviewerIds = Array.isArray(col[0].reviewer_ids) ? col[0].reviewer_ids : JSON.parse(col[0].reviewer_ids||'[]');
+    if (!isBuilder && !reviewerIds.includes(req.user.id)) {
+      return res.status(403).json({ error: 'You are not assigned as a reviewer for this column' });
+    }
+
+    const { rows } = await db.query(`
+      UPDATE rh_collab_values SET status=$1, reviewer_id=$2, reviewer_remarks=$3, reviewed_at=now(), updated_at=now()
+      WHERE cycle_id=$4 AND row_key=$5 AND col_id=$6 AND status='submitted'
+      RETURNING *
+    `, [action, req.user.id, remarks||null, req.params.cycleId, String(row_key), col_id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Value not found or not in submitted state' });
+    await db.query(`INSERT INTO rh_collab_audit (cycle_id, report_id, row_key, col_id, actor_id, action, value, remarks)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [req.params.cycleId, req.params.id, String(row_key), col_id, req.user.id, action, rows[0].value, remarks||null]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Audit trail for a row ──────────────────────────────────────────────────────────
+app.get('/api/reports/:id/collab-cycles/:cycleId/audit', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { row_key } = req.query;
+    let q = 'SELECT a.*, u.username FROM rh_collab_audit a LEFT JOIN rh_users u ON u.id=a.actor_id WHERE a.cycle_id=$1';
+    const params = [req.params.cycleId];
+    if (row_key) { q += ' AND a.row_key=$2'; params.push(String(row_key)); }
+    q += ' ORDER BY a.created_at ASC';
+    const { rows } = await db.query(q, params);
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── History: closed cycles accessible to defined users ────────────────────────────
+app.get('/api/reports/:id/collab-history', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { rows: cycles } = await db.query(
+      "SELECT * FROM rh_collab_cycles WHERE report_id=$1 AND status='closed' ORDER BY closed_at DESC",
+      [req.params.id]
+    );
+    // Filter: admin/subadmin see all; others see only cycles where they're in history_viewer_ids
+    const filtered = cycles.filter(c => {
+      if (['admin','subadmin'].includes(req.user.role)) return true;
+      const ids = Array.isArray(c.history_viewer_ids) ? c.history_viewer_ids : JSON.parse(c.history_viewer_ids||'[]');
+      return ids.includes(req.user.id);
+    });
+    res.json(filtered);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Builder: row key field setting (stored in report config) ─────────────────────
+// This is handled via the existing PATCH /api/reports/:id/config endpoint — no new endpoint needed.
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`ReportHub API running on port ${PORT}`));

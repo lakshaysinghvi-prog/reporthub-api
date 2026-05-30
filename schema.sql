@@ -136,3 +136,74 @@ CREATE TABLE IF NOT EXISTS rh_custom_credentials (
   updated_by   UUID REFERENCES rh_users(id),
   UNIQUE (provider)
 );
+
+-- ── Phase 3: Collaborative Workflow ──────────────────────────────────────────────
+
+-- Enable collab mode per report
+ALTER TABLE rh_reports ADD COLUMN IF NOT EXISTS collab_enabled BOOLEAN DEFAULT false;
+
+-- Collab column definitions (builder defines extra columns for collaboration)
+CREATE TABLE IF NOT EXISTS rh_collab_columns (
+  id            BIGSERIAL PRIMARY KEY,
+  report_id     UUID NOT NULL REFERENCES rh_reports(id) ON DELETE CASCADE,
+  label         TEXT NOT NULL,
+  col_type      TEXT NOT NULL DEFAULT 'input' CHECK (col_type IN ('input','workflow')),
+  inputter_ids  JSONB DEFAULT '[]',   -- user UUIDs who can input
+  reviewer_ids  JSONB DEFAULT '[]',   -- user UUIDs who can approve/reject/hold (workflow type only)
+  ref_column    TEXT,                  -- optional: name of a data column for reference display
+  col_order     INT DEFAULT 0,
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  updated_at    TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_rcc_report ON rh_collab_columns(report_id);
+
+-- Collab cycles (monthly periods — only one open at a time per report)
+CREATE TABLE IF NOT EXISTS rh_collab_cycles (
+  id                  BIGSERIAL PRIMARY KEY,
+  report_id           UUID NOT NULL REFERENCES rh_reports(id) ON DELETE CASCADE,
+  period_label        TEXT NOT NULL,    -- e.g. "May 2026"
+  status              TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','closed')),
+  history_viewer_ids  JSONB DEFAULT '[]',  -- users who can see this cycle in History
+  opened_by           UUID REFERENCES rh_users(id),
+  closed_by           UUID REFERENCES rh_users(id),
+  closed_at           TIMESTAMPTZ,
+  created_at          TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_rcyc_report ON rh_collab_cycles(report_id);
+
+-- Collab cell values (one row per data-row × collab-column × cycle)
+CREATE TABLE IF NOT EXISTS rh_collab_values (
+  id               BIGSERIAL PRIMARY KEY,
+  cycle_id         BIGINT NOT NULL REFERENCES rh_collab_cycles(id) ON DELETE CASCADE,
+  report_id        UUID NOT NULL REFERENCES rh_reports(id) ON DELETE CASCADE,
+  row_key          TEXT NOT NULL,      -- value of the builder-designated key column
+  col_id           BIGINT NOT NULL REFERENCES rh_collab_columns(id) ON DELETE CASCADE,
+  value            NUMERIC,            -- the input value (default 0 = not stored)
+  remarks          TEXT,               -- inputter remarks
+  status           TEXT NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending','submitted','approved','rejected','hold')),
+  inputter_id      UUID REFERENCES rh_users(id),
+  reviewer_id      UUID REFERENCES rh_users(id),
+  reviewer_remarks TEXT,
+  reviewed_at      TIMESTAMPTZ,
+  updated_at       TIMESTAMPTZ DEFAULT now(),
+  UNIQUE (cycle_id, row_key, col_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rcv_cycle ON rh_collab_values(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_rcv_rowkey ON rh_collab_values(cycle_id, row_key);
+
+-- Immutable audit log (every save/submit/approve/reject/hold action)
+CREATE TABLE IF NOT EXISTS rh_collab_audit (
+  id         BIGSERIAL PRIMARY KEY,
+  cycle_id   BIGINT NOT NULL REFERENCES rh_collab_cycles(id) ON DELETE CASCADE,
+  report_id  UUID NOT NULL REFERENCES rh_reports(id) ON DELETE CASCADE,
+  row_key    TEXT NOT NULL,
+  col_id     BIGINT REFERENCES rh_collab_columns(id) ON DELETE SET NULL,
+  actor_id   UUID REFERENCES rh_users(id),
+  action     TEXT NOT NULL,   -- 'save'|'submit'|'approved'|'rejected'|'hold'
+  value      NUMERIC,
+  remarks    TEXT,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_rca_cycle ON rh_collab_audit(cycle_id);
+CREATE INDEX IF NOT EXISTS idx_rca_rowkey ON rh_collab_audit(cycle_id, row_key);
