@@ -1300,6 +1300,18 @@ setInterval(runAutoRefreshJob, 60 * 1000);
 // ── PHASE 3: COLLABORATIVE WORKFLOW ─────────────────────────────────────────────
 // ────────────────────────────────────────────────────────────────────────────────
 
+// ── Lightweight: return field names for a report (for collab setup dropdowns) ──────
+app.get('/api/reports/:id/fields', auth([]), async (req, res) => {
+  try {
+    const { rows: ds } = await db.query('SELECT fields FROM rh_datasets WHERE report_id=$1', [req.params.id]);
+    if (ds[0]?.fields) return res.json(ds[0].fields);
+    // Fallback: read first row and extract keys
+    const { rows: sample } = await db.query('SELECT row_data FROM rh_rows WHERE report_id=$1 LIMIT 1', [req.params.id]);
+    const fields = sample[0] ? Object.keys(sample[0].row_data) : [];
+    res.json(fields);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Toggle collab mode on a report ───────────────────────────────────────────────
 app.patch('/api/reports/:id/collab-toggle', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
   try {
