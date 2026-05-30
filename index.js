@@ -1334,6 +1334,30 @@ app.get('/api/reports/:id/fields', auth([]), async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Diagnostic: test all collab queries (temporary debug endpoint) ────────────────
+app.get('/api/debug-collab/:id', auth(['admin']), async (req, res) => {
+  const results = {};
+  const queries = {
+    users: `SELECT id, username FROM rh_users LIMIT 1`,
+    users_status: `SELECT id, username, role, COALESCE(status, 'active') AS status FROM rh_users ORDER BY username LIMIT 1`,
+    collab_columns: `SELECT * FROM rh_collab_columns WHERE report_id=$1 LIMIT 1`,
+    collab_cycles: `SELECT * FROM rh_collab_cycles WHERE report_id=$1 LIMIT 1`,
+    datasets: `SELECT fields FROM rh_datasets WHERE report_id=$1 LIMIT 1`,
+    rh_rows: `SELECT row_data FROM rh_rows WHERE report_id=$1 LIMIT 1`,
+    collab_enabled: `SELECT collab_enabled FROM rh_reports WHERE id=$1`,
+  };
+  for (const [name, q] of Object.entries(queries)) {
+    try {
+      const params = q.includes('$1') ? [req.params.id] : [];
+      const { rows } = await db.query(q, params);
+      results[name] = { ok: true, rows: rows.length };
+    } catch(e) {
+      results[name] = { ok: false, error: e.message };
+    }
+  }
+  res.json(results);
+});
+
 // ── Toggle collab mode on a report ───────────────────────────────────────────────
 app.patch('/api/reports/:id/collab-toggle', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
   try {
