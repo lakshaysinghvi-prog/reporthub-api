@@ -1460,6 +1460,19 @@ app.patch('/api/reports/:id/collab-cycles/:cycleId/close', auth(['admin','subadm
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
+app.patch('/api/reports/:id/collab-cycles/:cycleId/rename', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { label } = req.body;
+    if (!label || !label.trim()) return res.status(400).json({ error: 'Label required' });
+    const { rows } = await db.query(
+      `UPDATE rh_collab_cycles SET period_label=$1 WHERE id=$2 AND report_id=$3 RETURNING *`,
+      [label.trim(), req.params.cycleId, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Cycle not found' });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── Collab values (cell-level input/workflow) ──────────────────────────────────────
 // GET all values for a cycle
 app.get('/api/reports/:id/collab-cycles/:cycleId/values', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
