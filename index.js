@@ -1372,7 +1372,7 @@ app.patch('/api/reports/:id/collab-toggle', auth(['admin','subadmin','subadmin_u
 app.get('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
   try {
     const { rows } = await db.query(
-      'SELECT * FROM rh_collab_columns WHERE report_id=$1 ORDER BY col_order',
+      'SELECT * FROM rh_collab_columns WHERE report_id=$1 ORDER BY col_order ASC, id ASC',
       [req.params.id]
     );
     res.json(rows);
