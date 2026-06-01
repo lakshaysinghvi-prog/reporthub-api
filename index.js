@@ -25,6 +25,19 @@ const auth = (roles = []) => (req, res, next) => {
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
 
+// ── Startup migrations ──────────────────────────────────────────────────────────
+(async()=>{
+  try{
+    // 1. Add 'modified' to collab_values status constraint
+    await db.query(`ALTER TABLE rh_collab_values DROP CONSTRAINT IF EXISTS rh_collab_values_status_check`);
+    await db.query(`ALTER TABLE rh_collab_values ADD CONSTRAINT rh_collab_values_status_check
+      CHECK (status IN ('pending','submitted','approved','rejected','hold','modified'))`);
+    // 2. Add validation_config column to collab_columns
+    await db.query(`ALTER TABLE rh_collab_columns ADD COLUMN IF NOT EXISTS validation_config JSONB DEFAULT NULL`);
+    console.log('Migrations OK');
+  }catch(e){console.error('Migration error:',e.message);}
+})();
+
 // ── Health ──────────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({
   ok: true, version: '3.0', time: new Date().toISOString(),
@@ -1470,6 +1483,30 @@ app.patch('/api/reports/:id/collab-cycles/:cycleId/rename', auth(['admin','subad
     );
     if (!rows[0]) return res.status(404).json({ error: 'Cycle not found' });
     res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// DELETE a cycle (admin only — cascades to values + audit)
+app.delete('/api/reports/:id/collab-cycles/:cycleId', auth(['admin']), async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `DELETE FROM rh_collab_cycles WHERE id=$1 AND report_id=$2 RETURNING id, period_label`,
+      [req.params.cycleId, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Cycle not found' });
+    res.json({ deleted: true, ...rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// GET export — workflow view as JSON for Excel download
+app.get('/api/reports/:id/collab-cycles/:cycleId/export', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const [cols, vals, rows] = await Promise.all([
+      db.query('SELECT * FROM rh_collab_columns WHERE report_id=$1 ORDER BY col_order ASC, id ASC', [req.params.id]),
+      db.query('SELECT v.*, u1.username as inputter_name, u2.username as reviewer_name FROM rh_collab_values v LEFT JOIN rh_users u1 ON u1.id=v.inputter_id LEFT JOIN rh_users u2 ON u2.id=v.reviewer_id WHERE v.cycle_id=$1', [req.params.cycleId]),
+      db.query('SELECT data FROM rh_rows WHERE report_id=$1 ORDER BY row_number', [req.params.id])
+    ]);
+    res.json({ columns: cols.rows, values: vals.rows, dataRows: rows.rows.map(r=>r.data) });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
