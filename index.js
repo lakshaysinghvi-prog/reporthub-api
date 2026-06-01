@@ -1544,11 +1544,11 @@ app.patch('/api/reports/:id/collab-cycles/:cycleId/values/submit', auth(['admin'
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// PATCH review a value (reviewer: approve / reject / hold)
+// PATCH review a value (reviewer: approve / reject / hold / modified)
 app.patch('/api/reports/:id/collab-cycles/:cycleId/values/review', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
   try {
-    const { row_key, col_id, action, remarks } = req.body; // action: 'approved'|'rejected'|'hold'
-    if (!['approved','rejected','hold'].includes(action)) return res.status(400).json({ error: 'action must be approved/rejected/hold' });
+    const { row_key, col_id, action, remarks, modified_value } = req.body; // action: 'approved'|'rejected'|'hold'|'modified'
+    if (!['approved','rejected','hold','modified'].includes(action)) return res.status(400).json({ error: 'action must be approved/rejected/hold/modified' });
 
     const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
     if (!cyc[0] || cyc[0].status !== 'open') return res.status(409).json({ error: 'Cycle is closed' });
@@ -1562,15 +1562,33 @@ app.patch('/api/reports/:id/collab-cycles/:cycleId/values/review', auth(['admin'
       return res.status(403).json({ error: 'You are not assigned as a reviewer for this column' });
     }
 
-    const { rows } = await db.query(`
-      UPDATE rh_collab_values SET status=$1, reviewer_id=$2, reviewer_remarks=$3, reviewed_at=now(), updated_at=now()
-      WHERE cycle_id=$4 AND row_key=$5 AND col_id=$6 AND status='submitted'
-      RETURNING *
-    `, [action, req.user.id, remarks||null, req.params.cycleId, String(row_key), col_id]);
+    // For 'modified': update value to reviewer's value; for value=0 force rejected
+    let finalAction = action;
+    let finalValue = null;
+    if (action === 'modified' && modified_value !== undefined && modified_value !== null) {
+      finalValue = parseFloat(modified_value) || 0;
+      if (finalValue === 0) finalAction = 'rejected'; // zero value = rejected
+    }
+
+    let updateResult;
+    if (finalValue !== null && finalAction === 'modified') {
+      updateResult = await db.query(`
+        UPDATE rh_collab_values SET status=$1, reviewer_id=$2, reviewer_remarks=$3, reviewed_at=now(), updated_at=now(), value=$7
+        WHERE cycle_id=$4 AND row_key=$5 AND col_id=$6 AND status='submitted'
+        RETURNING *
+      `, [finalAction, req.user.id, remarks||null, req.params.cycleId, String(row_key), col_id, finalValue]);
+    } else {
+      updateResult = await db.query(`
+        UPDATE rh_collab_values SET status=$1, reviewer_id=$2, reviewer_remarks=$3, reviewed_at=now(), updated_at=now()
+        WHERE cycle_id=$4 AND row_key=$5 AND col_id=$6 AND status='submitted'
+        RETURNING *
+      `, [finalAction, req.user.id, remarks||null, req.params.cycleId, String(row_key), col_id]);
+    }
+    const { rows } = updateResult;
     if (!rows[0]) return res.status(404).json({ error: 'Value not found or not in submitted state' });
     await db.query(`INSERT INTO rh_collab_audit (cycle_id, report_id, row_key, col_id, actor_id, action, value, remarks)
       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [req.params.cycleId, req.params.id, String(row_key), col_id, req.user.id, action, rows[0].value, remarks||null]);
+      [req.params.cycleId, req.params.id, String(row_key), col_id, req.user.id, finalAction, rows[0].value, remarks||null]);
     res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
