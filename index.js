@@ -25,21 +25,6 @@ const auth = (roles = []) => (req, res, next) => {
   } catch { res.status(401).json({ error: 'Invalid token' }); }
 };
 
-// ── Startup migrations ──────────────────────────────────────────────────────────
-(async()=>{
-  try{
-    // 1. Add 'modified' to collab_values status constraint
-    await db.query(`ALTER TABLE rh_collab_values DROP CONSTRAINT IF EXISTS rh_collab_values_status_check`);
-    await db.query(`ALTER TABLE rh_collab_values ADD CONSTRAINT rh_collab_values_status_check
-      CHECK (status IN ('pending','submitted','approved','rejected','hold','modified'))`);
-    // 2. Add validation_config column to collab_columns
-    await db.query(`ALTER TABLE rh_collab_columns ADD COLUMN IF NOT EXISTS validation_config JSONB DEFAULT NULL`);
-    // 3. Add reviewer_value column to collab_values (stores reviewer's override; value stays as inputter's original)
-    await db.query(`ALTER TABLE rh_collab_values ADD COLUMN IF NOT EXISTS reviewer_value NUMERIC DEFAULT NULL`);
-    console.log('Migrations OK');
-  }catch(e){console.error('Migration error:',e.message);}
-})();
-
 // ── Health ──────────────────────────────────────────────────────────────────────
 app.get('/health', (_, res) => res.json({
   ok: true, version: '3.0', time: new Date().toISOString(),
@@ -259,7 +244,7 @@ app.get('/auth/google/callback', async (req, res) => {
 
 
 // ── Custom credentials management ─────────────────────────────────────────────
-app.get('/api/custom-credentials', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.get('/api/custom-credentials', auth(['admin','subadmin']), async (req, res) => {
   try {
     const { rows } = await db.query('SELECT provider, client_id, tenant_id, updated_at FROM rh_custom_credentials');
     const result = {};
@@ -437,7 +422,7 @@ async function downloadWithGoogleDrive(userId, shareUrl) {
   return await resp.arrayBuffer();
 }
 
-function parseXlsxBuffer(buf, sheetName) {
+function parseXlsxBuffer(buf, sheetName, rangeOverride) {
   let wb;
   try { wb = XLSX.read(buf, { type: 'buffer', cellDates: true }); }
   catch(e) { throw new Error('Could not parse file as Excel: ' + e.message); }
@@ -445,7 +430,10 @@ function parseXlsxBuffer(buf, sheetName) {
   const wsName = sheetName && wb.SheetNames.includes(sheetName) ? sheetName : wb.SheetNames[0];
   const ws = wb.Sheets[wsName];
   if (!ws) throw new Error(`Sheet "${wsName}" not found. Available: ${sheetNames.join(', ')}`);
-  if (ws['!ref']) {
+  if (rangeOverride && rangeOverride.trim()) {
+    try { XLSX.utils.decode_range(rangeOverride.trim()); ws['!ref'] = rangeOverride.trim().toUpperCase(); }
+    catch(e) { /* invalid range — use sheet default */ }
+  } else if (ws['!ref']) {
     const r = XLSX.utils.decode_range(ws['!ref']);
     if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX.utils.encode_range(r); }
   }
@@ -483,8 +471,8 @@ function parseXlsxBuffer(buf, sheetName) {
 }
 
 // ── Main fetch-url endpoint ─────────────────────────────────────────────────────
-app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  const { url, sheetName } = req.body;
+app.post('/api/fetch-url', auth(['admin','user']), async (req, res) => {
+  const { url, sheetName, rangeOverride } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
   // For viewer role, use the admin's stored OAuth tokens
   let userId = req.user.id;
@@ -500,7 +488,7 @@ app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), as
     if (isMicrosoft) {
       try {
         const buf = await downloadWithMicrosoftGraph(userId, url);
-        const result = parseXlsxBuffer(buf, sheetName);
+        const result = parseXlsxBuffer(buf, sheetName, rangeOverride);
         return res.json({ ok: true, ...result, rowCount: result.rows.length });
       } catch(e) {
         if (e.message.startsWith('NEEDS_AUTH:')) {
@@ -515,7 +503,7 @@ app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), as
     if (isGoogle) {
       try {
         const buf = await downloadWithGoogleDrive(userId, url);
-        const result = parseXlsxBuffer(buf, sheetName);
+        const result = parseXlsxBuffer(buf, sheetName, rangeOverride);
         return res.json({ ok: true, ...result, rowCount: result.rows.length });
       } catch(e) {
         if (e.message.startsWith('NEEDS_AUTH:')) {
@@ -535,7 +523,7 @@ app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), as
           headers: { 'User-Agent': 'Mozilla/5.0' }, redirect: 'follow' });
         if (apiResp.ok) {
           const buf = await apiResp.arrayBuffer();
-          const result = parseXlsxBuffer(buf, sheetName);
+          const result = parseXlsxBuffer(buf, sheetName, rangeOverride);
           return res.json({ ok: true, ...result, rowCount: result.rows.length });
         }
       } catch(e) { console.log('OneDrive public API failed:', e.message); }
@@ -569,7 +557,7 @@ app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), as
         return res.status(400).json({ error: 'Got a login page instead of the file. Share the file publicly or connect an account.' });
       }
     }
-    const result = parseXlsxBuffer(buf, sheetName);
+    const result = parseXlsxBuffer(buf, sheetName, rangeOverride);
     return res.json({ ok: true, ...result, rowCount: result.rows.length });
   } catch(e) {
     console.error('fetch-url error:', e.message);
@@ -585,40 +573,29 @@ app.post('/api/login', async (req, res) => {
     if (!rows[0]) return res.status(401).json({ error: 'Invalid credentials' });
     const ok = await bcrypt.compare(password, rows[0].password_hash);
     if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
-    if (rows[0].status === 'pending')
-      return res.status(403).json({ error: 'Account pending approval by administrator. Please wait.' });
     const token = jwt.sign(
       { id: rows[0].id, username: rows[0].username, role: rows[0].role },
       process.env.JWT_SECRET,
-      { expiresIn: '7d' }
+      { expiresIn: '10h' }
     );
-    res.json({ token, role: rows[0].role, username: rows[0].username, id: rows[0].id });
+    res.json({ token, role: rows[0].role, username: rows[0].username });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── Users management ─────────────────────────────────────────────────────────
-app.get('/api/users', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  try {
-    const { rows } = await db.query(
-      `SELECT id, username, role, COALESCE(status, 'active') AS status FROM rh_users ORDER BY username`
-    );
-    res.json(rows);
-  } catch(e) { res.status(500).json({ error: e.message }); }
+// ── Users (admin only) ────────────────────────────────────────────────────────
+app.get('/api/users', auth(['admin','subadmin']), async (req, res) => {
+  const { rows } = await db.query("SELECT id, username, role FROM rh_users ORDER BY username");
+  res.json(rows);
 });
 
-app.post('/api/users', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.post('/api/users', auth(['admin','subadmin']), async (req, res) => {
   try {
     const { username, password, role } = req.body;
     if (!username || !password) return res.status(400).json({ error: 'Username and password required' });
-    // Sub-admins cannot create admin/subadmin accounts
-    if (req.user.role !== 'admin' && ['admin','subadmin'].includes(role))
-      return res.status(403).json({ error: 'Only Super Admin can create admin/sub-admin accounts' });
     const hash = await bcrypt.hash(password, 10);
-    // Users created by sub-admins require approval; admins activate immediately
-    const status = req.user.role === 'admin' ? 'active' : 'pending';
     const { rows } = await db.query(
-      'INSERT INTO rh_users(username, password_hash, role, status) VALUES($1,$2,$3,$4) RETURNING id, username, role, status',
-      [username.trim(), hash, role || 'user', status]
+      'INSERT INTO rh_users(username, password_hash, role) VALUES($1,$2,$3) RETURNING id, username, role',
+      [username.trim(), hash, role || 'user']
     );
     res.json(rows[0]);
   } catch (e) {
@@ -627,22 +604,10 @@ app.post('/api/users', auth(['admin','subadmin','subadmin_user']), async (req, r
   }
 });
 
-// Approve a pending user (admin only)
-app.patch('/api/users/:id/approve', auth(['admin']), async (req, res) => {
-  try {
-    const { rows } = await db.query(
-      "UPDATE rh_users SET status='active' WHERE id=$1 RETURNING id, username, role, status",
-      [req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'User not found' });
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
 app.patch('/api/users/:id/role', auth(['admin']), async (req, res) => {
   try {
     const { role } = req.body;
-    if (!['admin','subadmin','subadmin_user','user'].includes(role))
+    if (!['admin','subadmin','user'].includes(role))
       return res.status(400).json({ error: 'Invalid role' });
     // Never demote the last admin
     if (role !== 'admin') {
@@ -651,7 +616,7 @@ app.patch('/api/users/:id/role', auth(['admin']), async (req, res) => {
         return res.status(400).json({ error: 'Cannot demote the last super admin' });
     }
     const { rows } = await db.query(
-      'UPDATE rh_users SET role=$1 WHERE id=$2 RETURNING id,username,role,COALESCE(status,\'active\') AS status',
+      'UPDATE rh_users SET role=$1 WHERE id=$2 RETURNING id,username,role',
       [role, req.params.id]
     );
     if (!rows[0]) return res.status(404).json({ error: 'User not found' });
@@ -721,7 +686,6 @@ app.get('/api/reports', auth([]), async (req, res) => {
       // Super admin: see ALL reports
       q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
              r.row_count, r.field_count, r.created_at, r.created_by,
-             r.collab_enabled,
              u.username AS created_by_username
            FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
            ORDER BY r.created_at DESC`;
@@ -729,29 +693,15 @@ app.get('/api/reports', auth([]), async (req, res) => {
       // Sub-admin: see only their own reports
       q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
              r.row_count, r.field_count, r.created_at, r.created_by,
-             r.collab_enabled,
              u.username AS created_by_username
            FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
            WHERE r.created_by=$1 ORDER BY r.created_at DESC`;
-      params = [userId];
-    } else if (role === 'subadmin_user') {
-      // SubAdmin+User: see own created reports AND published reports assigned to them
-      q = `SELECT DISTINCT r.id, r.name, r.config, r.card_fields, r.is_published,
-             r.row_count, r.field_count, r.created_at, r.created_by,
-             r.collab_enabled,
-             u.username AS created_by_username
-           FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
-           WHERE r.created_by=$1
-              OR (r.is_published = true AND EXISTS(
-                    SELECT 1 FROM rh_report_access ra WHERE ra.report_id=r.id AND ra.user_id=$1
-                  ))
-           ORDER BY r.created_at DESC`;
       params = [userId];
     } else {
       // User: see only published reports explicitly assigned to them
       // (if a report has NO access rows, it is NOT visible to regular users unless assigned)
       q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
-             r.row_count, r.field_count, r.created_at, r.collab_enabled
+             r.row_count, r.field_count, r.created_at
            FROM rh_reports r
            INNER JOIN rh_report_access ra ON ra.report_id = r.id
            WHERE r.is_published = true AND ra.user_id = $1
@@ -766,7 +716,7 @@ app.get('/api/reports', auth([]), async (req, res) => {
 
 // ── Report access management ───────────────────────────────────────────────────
 // Get users who have access to a specific report
-app.get('/api/reports/:id/access', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.get('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
   try {
     // Subadmin can only manage their own reports
     if (req.user.role === 'subadmin') {
@@ -780,14 +730,14 @@ app.get('/api/reports/:id/access', auth(['admin','subadmin','subadmin_user']), a
          CASE WHEN ra.user_id IS NOT NULL THEN true ELSE false END as has_access
        FROM rh_users u
        LEFT JOIN rh_report_access ra ON ra.report_id=$1 AND ra.user_id=u.id
-       WHERE u.role IN ('user','subadmin_user')
+       WHERE u.role='user'
        ORDER BY u.username`, [req.params.id]);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Set report access (replace all users for this report)
-app.put('/api/reports/:id/access', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.put('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
   const client = await db.connect();
   try {
     if (req.user.role === 'subadmin') {
@@ -812,7 +762,7 @@ app.put('/api/reports/:id/access', auth(['admin','subadmin','subadmin_user']), a
   } finally { client.release(); }
 });
 
-app.post('/api/reports', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.post('/api/reports', auth(['admin','subadmin']), async (req, res) => {
   const client = await db.connect();
   try {
     const { name, config, cardFields, rows, fields, numFields } = req.body;
@@ -859,39 +809,8 @@ async function assertReportOwner(req, res) {
   return true;
 }
 
-// ── Auto-refresh schedule ─────────────────────────────────────────────────────
-// Get schedule for a report
-app.get('/api/reports/:id/refresh-schedule', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  if (!await assertReportOwner(req, res)) return;
-  try {
-    const { rows } = await db.query(
-      'SELECT interval_minutes, enabled, last_run, next_run FROM rh_refresh_schedules WHERE report_id=$1',
-      [req.params.id]
-    );
-    res.json(rows[0] || { interval_minutes: 0, enabled: false, last_run: null, next_run: null });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// Set schedule for a report
-app.put('/api/reports/:id/refresh-schedule', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  if (!await assertReportOwner(req, res)) return;
-  try {
-    const { intervalMinutes, enabled } = req.body;
-    const mins = parseInt(intervalMinutes) || 0;
-    const isEnabled = !!enabled && mins > 0;
-    const nextRun = isEnabled ? new Date(Date.now() + mins * 60 * 1000) : null;
-    await db.query(`
-      INSERT INTO rh_refresh_schedules(report_id, interval_minutes, enabled, next_run, updated_at)
-      VALUES($1,$2,$3,$4,now())
-      ON CONFLICT(report_id) DO UPDATE SET
-        interval_minutes=$2, enabled=$3, next_run=$4, updated_at=now()
-    `, [req.params.id, mins, isEnabled, nextRun]);
-    res.json({ ok: true, intervalMinutes: mins, enabled: isEnabled, nextRun });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
 // Update report config only (no row replacement) — used for filter/layout saves
-app.patch('/api/reports/:id/config', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.patch('/api/reports/:id/config', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
   try {
     const { config, name, numFields } = req.body;
@@ -909,14 +828,14 @@ app.patch('/api/reports/:id/config', auth(['admin','subadmin','subadmin_user']),
     const vals = [JSON.stringify(config)];
     if (nfArr) { cols.push(`num_fields=$${vals.length+1}`); vals.push(JSON.stringify(nfArr)); }
     if (name) { cols.push(`name=$${vals.length+1}`); vals.push(name); }
-    vals.push(req.params.id);
-    await db.query(`UPDATE rh_reports SET ${cols.join(', ')} WHERE id=$${vals.length}`, vals);
+    cols.push(`WHERE id=$${vals.length+1}`); vals.push(req.params.id);
+    await db.query(`UPDATE rh_reports SET ${cols.join(', ')}`, vals);
     res.json({ id: req.params.id });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
 // Update report in-place (preserves is_published and rh_report_access)
-app.put('/api/reports/:id', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.put('/api/reports/:id', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
   const client = await db.connect();
   try {
@@ -951,7 +870,7 @@ app.put('/api/reports/:id', auth(['admin','subadmin','subadmin_user']), async (r
   } finally { client.release(); }
 });
 
-app.delete('/api/reports/:id', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.delete('/api/reports/:id', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
   try {
     await db.query('DELETE FROM rh_reports WHERE id=$1', [req.params.id]);
@@ -960,13 +879,13 @@ app.delete('/api/reports/:id', auth(['admin','subadmin','subadmin_user']), async
 });
 
 // ── Report access management ─────────────────────────────────────────────────────
-app.get('/api/reports/:id/access', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.get('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
   try {
     const { rows } = await db.query(
       `SELECT u.id, u.username, u.role,
          EXISTS(SELECT 1 FROM rh_report_access ra WHERE ra.report_id=$1 AND ra.user_id=u.id) AS has_access
-       FROM rh_users u WHERE u.role IN ('user','subadmin_user') ORDER BY u.username`,
+       FROM rh_users u WHERE u.role='user' ORDER BY u.username`,
       [req.params.id]
     );
     const { rows: acRows } = await db.query(
@@ -975,7 +894,7 @@ app.get('/api/reports/:id/access', auth(['admin','subadmin','subadmin_user']), a
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-app.put('/api/reports/:id/access', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.put('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
   try {
     const { userIds } = req.body;
@@ -990,7 +909,7 @@ app.put('/api/reports/:id/access', auth(['admin','subadmin','subadmin_user']), a
 });
 
 // Publish — always sets published=true, never touches other reports
-app.patch('/api/reports/:id/publish', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.patch('/api/reports/:id/publish', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
   try {
     await db.query('UPDATE rh_reports SET is_published=true WHERE id=$1', [req.params.id]);
@@ -999,7 +918,7 @@ app.patch('/api/reports/:id/publish', auth(['admin','subadmin','subadmin_user'])
 });
 
 // Unpublish — always sets published=false
-app.patch('/api/reports/:id/unpublish', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.patch('/api/reports/:id/unpublish', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
   try {
     await db.query('UPDATE rh_reports SET is_published=false WHERE id=$1', [req.params.id]);
@@ -1014,18 +933,8 @@ app.get('/api/reports/:id/data', auth([]), async (req, res) => {
       'SELECT is_published, num_fields FROM rh_reports WHERE id=$1', [req.params.id]
     );
     if (!rpt[0]) return res.status(404).json({ error: 'Not found' });
-    if (!rpt[0].is_published) {
-      // Admins and sub-admins always allowed; subadmin_user allowed only for their own reports
-      if (req.user.role === 'admin' || req.user.role === 'subadmin') {
-        // allowed
-      } else if (req.user.role === 'subadmin_user') {
-        const { rows: ownerCheck } = await db.query('SELECT created_by FROM rh_reports WHERE id=$1', [req.params.id]);
-        if (!ownerCheck[0] || ownerCheck[0].created_by !== req.user.id)
-          return res.status(403).json({ error: 'Not published' });
-      } else {
-        return res.status(403).json({ error: 'Not published' });
-      }
-    }
+    if (!rpt[0].is_published && req.user.role !== 'admin' && req.user.role !== 'subadmin')
+      return res.status(403).json({ error: 'Not published' });
 
     const { rows: ds } = await db.query('SELECT fields FROM rh_datasets WHERE report_id=$1', [req.params.id]);
     const { rows: dataRows } = await db.query(
@@ -1040,7 +949,7 @@ app.get('/api/reports/:id/data', auth([]), async (req, res) => {
 });
 
 // ── URL refresh (re-download Excel from a URL and re-import) ──────────────────
-app.post('/api/reports/:id/refresh-url', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+app.post('/api/reports/:id/refresh-url', auth(['admin']), async (req, res) => {
   try {
     const { url, sheetName } = req.body;
     const resp = await fetch(url);
@@ -1077,7 +986,7 @@ app.post('/api/reports/:id/refresh-url', auth(['admin','subadmin','subadmin_user
 });
 
 // ── Proxy URL fetch — downloads Excel/CSV from any URL server-side ─────────────
-app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+app.post('/api/fetch-url', auth(['admin','user']), async (req, res) => {
   try {
     const { url, sheetName } = req.body;
     if (!url) return res.status(400).json({ error: 'url is required' });
@@ -1222,466 +1131,6 @@ app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), as
   }
 });
 
-
-// ── Server-side auto-refresh background job ───────────────────────────────────
-// Runs every 60 seconds; finds reports due for refresh and re-fetches their data
-async function runAutoRefreshJob() {
-  try {
-    const { rows: jobs } = await db.query(`
-      SELECT rs.report_id, r.config
-      FROM rh_refresh_schedules rs
-      JOIN rh_reports r ON r.id = rs.report_id
-      WHERE rs.enabled = true AND rs.interval_minutes > 0
-        AND (rs.next_run IS NULL OR rs.next_run <= now())
-    `);
-    for (const job of jobs) {
-      const cfg = typeof job.config === 'string' ? JSON.parse(job.config) : (job.config || {});
-      const links = cfg.sourceLinks || [];
-      if (!links.length) continue;
-      const link = links[0];
-      try {
-        let downloadUrl = link.url;
-        // Apply same transforms as fetch-url
-        if (downloadUrl.includes('dropbox.com')) {
-          const u = new URL(downloadUrl); u.searchParams.set('dl','1'); downloadUrl = u.toString();
-        } else if (downloadUrl.includes('drive.google.com')) {
-          const m = downloadUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
-          if (m) downloadUrl = `https://drive.google.com/uc?export=download&id=${m[1]}&confirm=t`;
-        } else if (downloadUrl.includes('1drv.ms') || downloadUrl.includes('onedrive.live.com') ||
-                   downloadUrl.includes('sharepoint.com')) {
-          const encoded = Buffer.from(downloadUrl).toString('base64')
-            .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
-          try {
-            const r0 = await fetch(`https://api.onedrive.com/v1.0/shares/u!${encoded}/root/content`, { redirect:'follow' });
-            if (r0.ok) downloadUrl = r0.url;
-          } catch(e) {}
-        }
-        const resp = await fetch(downloadUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ReportHub/2.0)' },
-          redirect: 'follow',
-        });
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        const buf = await resp.arrayBuffer();
-        const XLSX2 = require('xlsx');
-        const wb = XLSX2.read(buf, { type:'buffer', cellDates:true });
-        const wsName = link.sheet && wb.SheetNames.includes(link.sheet) ? link.sheet : wb.SheetNames[0];
-        const ws = wb.Sheets[wsName];
-        if (!ws) throw new Error('Sheet not found');
-        if (ws['!ref']) {
-          const r = XLSX2.utils.decode_range(ws['!ref']);
-          if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX2.utils.encode_range(r); }
-        }
-        const rows = XLSX2.utils.sheet_to_json(ws, { defval:null, cellDates:true });
-        const client2 = await db.connect();
-        try {
-          await client2.query('BEGIN');
-          await client2.query('DELETE FROM rh_rows WHERE report_id=$1', [job.report_id]);
-          for (let i = 0; i < rows.length; i += 500) {
-            const batch = rows.slice(i, i+500);
-            const vals = batch.map((_,j)=>`($1,$${j+2})`).join(',');
-            await client2.query(`INSERT INTO rh_rows(report_id,row_data) VALUES ${vals}`,
-              [job.report_id, ...batch.map(r=>JSON.stringify(r))]);
-          }
-          await client2.query('UPDATE rh_reports SET row_count=$1 WHERE id=$2', [rows.length, job.report_id]);
-          await client2.query('COMMIT');
-        } catch(e2) { await client2.query('ROLLBACK'); throw e2; }
-        finally { client2.release(); }
-        // Update schedule — set next_run
-        const { rows: sched } = await db.query('SELECT interval_minutes FROM rh_refresh_schedules WHERE report_id=$1', [job.report_id]);
-        if (sched[0]) {
-          const nextRun = new Date(Date.now() + sched[0].interval_minutes * 60 * 1000);
-          await db.query('UPDATE rh_refresh_schedules SET last_run=now(), next_run=$1 WHERE report_id=$2',
-            [nextRun, job.report_id]);
-        }
-        console.log(`[AutoRefresh] report ${job.report_id}: ${rows.length} rows refreshed`);
-      } catch(e) {
-        console.error(`[AutoRefresh] report ${job.report_id} failed:`, e.message);
-        // Still update next_run to avoid hammering a broken source
-        const { rows: sched } = await db.query('SELECT interval_minutes FROM rh_refresh_schedules WHERE report_id=$1', [job.report_id]);
-        if (sched[0]) {
-          const nextRun = new Date(Date.now() + sched[0].interval_minutes * 60 * 1000);
-          await db.query('UPDATE rh_refresh_schedules SET last_run=now(), next_run=$1 WHERE report_id=$2',
-            [nextRun, job.report_id]);
-        }
-      }
-    }
-  } catch(e) {
-    console.error('[AutoRefresh] job error:', e.message);
-  }
-}
-
-// Start the auto-refresh background job (runs every 60 seconds)
-setInterval(runAutoRefreshJob, 60 * 1000);
-
-// ────────────────────────────────────────────────────────────────────────────────
-// ── PHASE 3: COLLABORATIVE WORKFLOW ─────────────────────────────────────────────
-// ────────────────────────────────────────────────────────────────────────────────
-
-// ── Lightweight: return field names for a report (for collab setup dropdowns) ──────
-app.get('/api/reports/:id/fields', auth([]), async (req, res) => {
-  try {
-    // Try rh_datasets first (fastest)
-    const { rows: ds } = await db.query('SELECT fields FROM rh_datasets WHERE report_id=$1', [req.params.id]);
-    if (ds[0]?.fields) {
-      const f = Array.isArray(ds[0].fields) ? ds[0].fields
-              : (typeof ds[0].fields === 'string' ? JSON.parse(ds[0].fields) : []);
-      if (f.length > 0) return res.json(f);
-    }
-    // Fallback: extract keys from first row in rh_rows
-    const { rows: sample } = await db.query('SELECT row_data FROM rh_rows WHERE report_id=$1 LIMIT 1', [req.params.id]);
-    if (sample[0]) {
-      const rd = typeof sample[0].row_data === 'string' ? JSON.parse(sample[0].row_data) : sample[0].row_data;
-      return res.json(Object.keys(rd || {}));
-    }
-    // Last resort: extract field names from report config
-    const { rows: rpt } = await db.query('SELECT config FROM rh_reports WHERE id=$1', [req.params.id]);
-    if (rpt[0]) {
-      const cfg = typeof rpt[0].config === 'string' ? JSON.parse(rpt[0].config) : (rpt[0].config || {});
-      const fields = new Set();
-      const extract = (c) => {
-        ['rows','columns','values','filters'].forEach(k => (c[k]||[]).forEach(x => x.field && fields.add(x.field)));
-      };
-      if (cfg.tabs) cfg.tabs.forEach(t => extract(t.config || {}));
-      extract(cfg);
-      return res.json([...fields]);
-    }
-    res.json([]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Diagnostic: test all collab queries (temporary debug endpoint) ────────────────
-app.get('/api/debug-collab/:id', auth(['admin']), async (req, res) => {
-  const results = {};
-  const queries = {
-    users: `SELECT id, username FROM rh_users LIMIT 1`,
-    users_status: `SELECT id, username, role, COALESCE(status, 'active') AS status FROM rh_users ORDER BY username LIMIT 1`,
-    collab_columns: `SELECT * FROM rh_collab_columns WHERE report_id=$1 LIMIT 1`,
-    collab_cycles: `SELECT * FROM rh_collab_cycles WHERE report_id=$1 LIMIT 1`,
-    datasets: `SELECT fields FROM rh_datasets WHERE report_id=$1 LIMIT 1`,
-    rh_rows: `SELECT row_data FROM rh_rows WHERE report_id=$1 LIMIT 1`,
-    collab_enabled: `SELECT collab_enabled FROM rh_reports WHERE id=$1`,
-  };
-  for (const [name, q] of Object.entries(queries)) {
-    try {
-      const params = q.includes('$1') ? [req.params.id] : [];
-      const { rows } = await db.query(q, params);
-      results[name] = { ok: true, rows: rows.length };
-    } catch(e) {
-      results[name] = { ok: false, error: e.message };
-    }
-  }
-  res.json(results);
-});
-
-// ── Toggle collab mode on a report ───────────────────────────────────────────────
-app.patch('/api/reports/:id/collab-toggle', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  try {
-    const { enabled } = req.body;
-    await db.query('UPDATE rh_reports SET collab_enabled=$1 WHERE id=$2', [!!enabled, req.params.id]);
-    res.json({ ok: true, collab_enabled: !!enabled });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Collab column definitions ─────────────────────────────────────────────────────
-// GET all collab columns for a report
-app.get('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  try {
-    const { rows } = await db.query(
-      'SELECT * FROM rh_collab_columns WHERE report_id=$1 ORDER BY col_order ASC, id ASC',
-      [req.params.id]
-    );
-    res.json(rows);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// POST create a collab column
-app.post('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  try {
-    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order, validation_config } = req.body;
-    const { rows } = await db.query(`
-      INSERT INTO rh_collab_columns (report_id, label, col_type, inputter_ids, reviewer_ids, ref_column, col_order, validation_config)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
-    `, [req.params.id, label, col_type||'input',
-        JSON.stringify(inputter_ids||[]), JSON.stringify(reviewer_ids||[]),
-        ref_column||null, col_order||0, validation_config?JSON.stringify(validation_config):null]);
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// PUT update a collab column
-app.put('/api/reports/:id/collab-columns/:colId', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  try {
-    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order, validation_config } = req.body;
-    const { rows } = await db.query(`
-      UPDATE rh_collab_columns
-      SET label=$1, col_type=$2, inputter_ids=$3, reviewer_ids=$4, ref_column=$5, col_order=$6,
-          validation_config=$7, updated_at=now()
-      WHERE id=$8 AND report_id=$9 RETURNING *
-    `, [label, col_type||'input',
-        JSON.stringify(inputter_ids||[]), JSON.stringify(reviewer_ids||[]),
-        ref_column||null, col_order||0,
-        validation_config?JSON.stringify(validation_config):null,
-        req.params.colId, req.params.id]);
-    if (!rows[0]) return res.status(404).json({ error: 'Column not found' });
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// DELETE a collab column
-app.delete('/api/reports/:id/collab-columns/:colId', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  try {
-    await db.query('DELETE FROM rh_collab_columns WHERE id=$1 AND report_id=$2', [req.params.colId, req.params.id]);
-    res.json({ ok: true });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Cycle management ──────────────────────────────────────────────────────────────
-// GET cycles for a report
-app.get('/api/reports/:id/collab-cycles', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  try {
-    const { rows } = await db.query(
-      'SELECT * FROM rh_collab_cycles WHERE report_id=$1 ORDER BY created_at DESC',
-      [req.params.id]
-    );
-    res.json(rows);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// POST open a new cycle (only admin/subadmin; only one open at a time)
-app.post('/api/reports/:id/collab-cycles', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  try {
-    const { period_label, history_viewer_ids } = req.body;
-    if (!period_label) return res.status(400).json({ error: 'period_label required (e.g. "May 2026")' });
-    const { rows } = await db.query(`
-      INSERT INTO rh_collab_cycles (report_id, period_label, status, history_viewer_ids, opened_by)
-      VALUES ($1,$2,'open',$3,$4) RETURNING *
-    `, [req.params.id, period_label, JSON.stringify(history_viewer_ids||[]), req.user.id]);
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// PATCH close a cycle (freezes it)
-app.patch('/api/reports/:id/collab-cycles/:cycleId/close', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  try {
-    const { rows } = await db.query(`
-      UPDATE rh_collab_cycles SET status='closed', closed_at=now(), closed_by=$1
-      WHERE id=$2 AND report_id=$3 AND status='open' RETURNING *
-    `, [req.user.id, req.params.cycleId, req.params.id]);
-    if (!rows[0]) return res.status(404).json({ error: 'Open cycle not found' });
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.patch('/api/reports/:id/collab-cycles/:cycleId/rename', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  try {
-    const { label } = req.body;
-    if (!label || !label.trim()) return res.status(400).json({ error: 'Label required' });
-    const { rows } = await db.query(
-      `UPDATE rh_collab_cycles SET period_label=$1 WHERE id=$2 AND report_id=$3 RETURNING *`,
-      [label.trim(), req.params.cycleId, req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Cycle not found' });
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// DELETE a cycle (admin only — cascades to values + audit)
-app.delete('/api/reports/:id/collab-cycles/:cycleId', auth(['admin']), async (req, res) => {
-  try {
-    const { rows } = await db.query(
-      `DELETE FROM rh_collab_cycles WHERE id=$1 AND report_id=$2 RETURNING id, period_label`,
-      [req.params.cycleId, req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Cycle not found' });
-    res.json({ deleted: true, ...rows[0] });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// GET export — workflow view as JSON for Excel download
-app.get('/api/reports/:id/collab-cycles/:cycleId/export', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  try {
-    const [cols, vals, dataRows] = await Promise.all([
-      db.query('SELECT * FROM rh_collab_columns WHERE report_id=$1 ORDER BY col_order ASC, id ASC', [req.params.id]),
-      db.query(`SELECT v.*, u1.username as inputter_name, u2.username as reviewer_name
-        FROM rh_collab_values v
-        LEFT JOIN rh_users u1 ON u1.id=v.inputter_id
-        LEFT JOIN rh_users u2 ON u2.id=v.reviewer_id
-        WHERE v.cycle_id=$1`, [req.params.cycleId]),
-      db.query('SELECT row_data FROM rh_rows WHERE report_id=$1 ORDER BY id', [req.params.id])
-    ]);
-    res.json({
-      columns: cols.rows,
-      values: vals.rows,
-      dataRows: dataRows.rows.map(r=>typeof r.row_data==='string'?JSON.parse(r.row_data):r.row_data)
-    });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// PATCH reopen a closed cycle (admin/subadmin)
-app.patch('/api/reports/:id/collab-cycles/:cycleId/reopen', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
-  try {
-    const { rows } = await db.query(
-      `UPDATE rh_collab_cycles SET status='open', closed_at=null, closed_by=null
-       WHERE id=$1 AND report_id=$2 AND status='closed' RETURNING *`,
-      [req.params.cycleId, req.params.id]
-    );
-    if (!rows[0]) return res.status(404).json({ error: 'Closed cycle not found' });
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Collab values (cell-level input/workflow) ──────────────────────────────────────
-// GET all values for a cycle
-app.get('/api/reports/:id/collab-cycles/:cycleId/values', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  try {
-    const { rows } = await db.query(
-      'SELECT * FROM rh_collab_values WHERE cycle_id=$1 ORDER BY row_key, col_id',
-      [req.params.cycleId]
-    );
-    res.json(rows);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// PUT upsert a draft value (inputter saves their value — not yet submitted)
-app.put('/api/reports/:id/collab-cycles/:cycleId/values', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  try {
-    const { row_key, col_id, value, remarks } = req.body;
-    if (row_key === undefined || col_id === undefined) return res.status(400).json({ error: 'row_key and col_id required' });
-
-    // Verify cycle is open
-    const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
-    if (!cyc[0] || cyc[0].status !== 'open') return res.status(409).json({ error: 'Cycle is closed' });
-
-    // Check column type — if 'input' just save approved straight away; if 'workflow' set pending
-    const { rows: col } = await db.query('SELECT col_type, inputter_ids FROM rh_collab_columns WHERE id=$1', [col_id]);
-    if (!col[0]) return res.status(404).json({ error: 'Column not found' });
-
-    // Verify user is an allowed inputter (or admin/subadmin)
-    const isBuilder = ['admin','subadmin','subadmin_user'].includes(req.user.role);
-    const inputterIds = Array.isArray(col[0].inputter_ids) ? col[0].inputter_ids : JSON.parse(col[0].inputter_ids||'[]');
-    if (!isBuilder && !inputterIds.includes(req.user.id)) {
-      return res.status(403).json({ error: 'You are not assigned as an inputter for this column' });
-    }
-
-    const newStatus = col[0].col_type === 'input' ? 'approved' : 'pending';
-    const { rows } = await db.query(`
-      INSERT INTO rh_collab_values (cycle_id, report_id, row_key, col_id, value, remarks, status, inputter_id, updated_at)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now())
-      ON CONFLICT (cycle_id, row_key, col_id)
-      DO UPDATE SET value=$5, remarks=$6, status=
-        CASE WHEN rh_collab_values.status IN ('approved','rejected') THEN 'pending' ELSE $7 END,
-        inputter_id=$8, updated_at=now()
-      RETURNING *
-    `, [req.params.cycleId, req.params.id, String(row_key), col_id, value, remarks||null, newStatus, req.user.id]);
-    // Write audit
-    await db.query(`INSERT INTO rh_collab_audit (cycle_id, report_id, row_key, col_id, actor_id, action, value, remarks)
-      VALUES ($1,$2,$3,$4,$5,'save',$6,$7)`,
-      [req.params.cycleId, req.params.id, String(row_key), col_id, req.user.id, value, remarks||null]);
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// PATCH submit a row's value for review (inputter submits)
-app.patch('/api/reports/:id/collab-cycles/:cycleId/values/submit', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  try {
-    const { row_key, col_id } = req.body;
-    const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
-    if (!cyc[0] || cyc[0].status !== 'open') return res.status(409).json({ error: 'Cycle is closed' });
-
-    const { rows } = await db.query(`
-      UPDATE rh_collab_values SET status='submitted', updated_at=now()
-      WHERE cycle_id=$1 AND row_key=$2 AND col_id=$3 AND inputter_id=$4 AND status='pending'
-      RETURNING *
-    `, [req.params.cycleId, String(row_key), col_id, req.user.id]);
-    if (!rows[0]) return res.status(404).json({ error: 'Value not found or not in pending state' });
-    await db.query(`INSERT INTO rh_collab_audit (cycle_id, report_id, row_key, col_id, actor_id, action, value, remarks)
-      VALUES ($1,$2,$3,$4,$5,'submit',$6,null)`,
-      [req.params.cycleId, req.params.id, String(row_key), col_id, req.user.id, rows[0].value]);
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// PATCH review a value (reviewer: approve / reject / hold / modified)
-app.patch('/api/reports/:id/collab-cycles/:cycleId/values/review', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  try {
-    const { row_key, col_id, action, remarks, modified_value } = req.body; // action: 'approved'|'rejected'|'hold'|'modified'
-    if (!['approved','rejected','hold','modified'].includes(action)) return res.status(400).json({ error: 'action must be approved/rejected/hold/modified' });
-
-    const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
-    if (!cyc[0] || cyc[0].status !== 'open') return res.status(409).json({ error: 'Cycle is closed' });
-
-    // Verify user is a reviewer for this column
-    const { rows: col } = await db.query('SELECT reviewer_ids FROM rh_collab_columns WHERE id=$1', [col_id]);
-    if (!col[0]) return res.status(404).json({ error: 'Column not found' });
-    const isBuilder = ['admin','subadmin'].includes(req.user.role);
-    const reviewerIds = Array.isArray(col[0].reviewer_ids) ? col[0].reviewer_ids : JSON.parse(col[0].reviewer_ids||'[]');
-    if (!isBuilder && !reviewerIds.includes(req.user.id)) {
-      return res.status(403).json({ error: 'You are not assigned as a reviewer for this column' });
-    }
-
-    // For 'modified': update value to reviewer's value; for value=0 force rejected
-    let finalAction = action;
-    let finalValue = null;
-    if (action === 'modified' && modified_value !== undefined && modified_value !== null) {
-      finalValue = parseFloat(modified_value) || 0;
-      if (finalValue === 0) finalAction = 'rejected'; // zero value = rejected
-    }
-
-    let updateResult;
-    if (finalValue !== null && finalAction === 'modified') {
-      updateResult = await db.query(`
-        UPDATE rh_collab_values SET status=$1, reviewer_id=$2, reviewer_remarks=$3, reviewed_at=now(), updated_at=now(), reviewer_value=$7
-        WHERE cycle_id=$4 AND row_key=$5 AND col_id=$6 AND status='submitted'
-        RETURNING *
-      `, [finalAction, req.user.id, remarks||null, req.params.cycleId, String(row_key), col_id, finalValue]);
-    } else {
-      updateResult = await db.query(`
-        UPDATE rh_collab_values SET status=$1, reviewer_id=$2, reviewer_remarks=$3, reviewed_at=now(), updated_at=now()
-        WHERE cycle_id=$4 AND row_key=$5 AND col_id=$6 AND status='submitted'
-        RETURNING *
-      `, [finalAction, req.user.id, remarks||null, req.params.cycleId, String(row_key), col_id]);
-    }
-    const { rows } = updateResult;
-    if (!rows[0]) return res.status(404).json({ error: 'Value not found or not in submitted state' });
-    await db.query(`INSERT INTO rh_collab_audit (cycle_id, report_id, row_key, col_id, actor_id, action, value, remarks)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-      [req.params.cycleId, req.params.id, String(row_key), col_id, req.user.id, finalAction, rows[0].value, remarks||null]);
-    res.json(rows[0]);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Audit trail for a row ──────────────────────────────────────────────────────────
-app.get('/api/reports/:id/collab-cycles/:cycleId/audit', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  try {
-    const { row_key } = req.query;
-    let q = 'SELECT a.*, u.username FROM rh_collab_audit a LEFT JOIN rh_users u ON u.id=a.actor_id WHERE a.cycle_id=$1';
-    const params = [req.params.cycleId];
-    if (row_key) { q += ' AND a.row_key=$2'; params.push(String(row_key)); }
-    q += ' ORDER BY a.created_at ASC';
-    const { rows } = await db.query(q, params);
-    res.json(rows);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── History: closed cycles accessible to defined users ────────────────────────────
-app.get('/api/reports/:id/collab-history', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
-  try {
-    const { rows: cycles } = await db.query(
-      "SELECT * FROM rh_collab_cycles WHERE report_id=$1 AND status='closed' ORDER BY closed_at DESC",
-      [req.params.id]
-    );
-    // Filter: admin/subadmin see all; others see only cycles where they're in history_viewer_ids
-    const filtered = cycles.filter(c => {
-      if (['admin','subadmin'].includes(req.user.role)) return true;
-      const ids = Array.isArray(c.history_viewer_ids) ? c.history_viewer_ids : JSON.parse(c.history_viewer_ids||'[]');
-      return ids.includes(req.user.id);
-    });
-    res.json(filtered);
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Builder: row key field setting (stored in report config) ─────────────────────
-// This is handled via the existing PATCH /api/reports/:id/config endpoint — no new endpoint needed.
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`ReportHub API running on port ${PORT}`));
