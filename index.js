@@ -34,6 +34,8 @@ const auth = (roles = []) => (req, res, next) => {
       CHECK (status IN ('pending','submitted','approved','rejected','hold','modified'))`);
     // 2. Add validation_config column to collab_columns
     await db.query(`ALTER TABLE rh_collab_columns ADD COLUMN IF NOT EXISTS validation_config JSONB DEFAULT NULL`);
+    // 3. Add reviewer_value column to collab_values (stores reviewer's override; value stays as inputter's original)
+    await db.query(`ALTER TABLE rh_collab_values ADD COLUMN IF NOT EXISTS reviewer_value NUMERIC DEFAULT NULL`);
     console.log('Migrations OK');
   }catch(e){console.error('Migration error:',e.message);}
 })();
@@ -1450,11 +1452,6 @@ app.post('/api/reports/:id/collab-cycles', auth(['admin','subadmin','subadmin_us
   try {
     const { period_label, history_viewer_ids } = req.body;
     if (!period_label) return res.status(400).json({ error: 'period_label required (e.g. "May 2026")' });
-    // Close any open cycle first — don't allow two open
-    const { rows: open } = await db.query(
-      "SELECT id FROM rh_collab_cycles WHERE report_id=$1 AND status='open'", [req.params.id]
-    );
-    if (open.length) return res.status(409).json({ error: 'Another cycle is already open. Close it before opening a new one.' });
     const { rows } = await db.query(`
       INSERT INTO rh_collab_cycles (report_id, period_label, status, history_viewer_ids, opened_by)
       VALUES ($1,$2,'open',$3,$4) RETURNING *
@@ -1523,11 +1520,6 @@ app.get('/api/reports/:id/collab-cycles/:cycleId/export', auth(['admin','subadmi
 // PATCH reopen a closed cycle (admin/subadmin)
 app.patch('/api/reports/:id/collab-cycles/:cycleId/reopen', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
   try {
-    // Ensure no other cycle is open for this report
-    const { rows: open } = await db.query(
-      `SELECT id FROM rh_collab_cycles WHERE report_id=$1 AND status='open'`, [req.params.id]
-    );
-    if (open.length) return res.status(409).json({ error: 'Another cycle is already open. Close it before reopening this one.' });
     const { rows } = await db.query(
       `UPDATE rh_collab_cycles SET status='open', closed_at=null, closed_by=null
        WHERE id=$1 AND report_id=$2 AND status='closed' RETURNING *`,
@@ -1638,7 +1630,7 @@ app.patch('/api/reports/:id/collab-cycles/:cycleId/values/review', auth(['admin'
     let updateResult;
     if (finalValue !== null && finalAction === 'modified') {
       updateResult = await db.query(`
-        UPDATE rh_collab_values SET status=$1, reviewer_id=$2, reviewer_remarks=$3, reviewed_at=now(), updated_at=now(), value=$7
+        UPDATE rh_collab_values SET status=$1, reviewer_id=$2, reviewer_remarks=$3, reviewed_at=now(), updated_at=now(), reviewer_value=$7
         WHERE cycle_id=$4 AND row_key=$5 AND col_id=$6 AND status='submitted'
         RETURNING *
       `, [finalAction, req.user.id, remarks||null, req.params.cycleId, String(row_key), col_id, finalValue]);
