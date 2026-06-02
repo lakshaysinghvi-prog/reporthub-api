@@ -588,7 +588,7 @@ app.post('/api/login', async (req, res) => {
     const token = jwt.sign(
       { id: rows[0].id, username: rows[0].username, role: rows[0].role },
       process.env.JWT_SECRET,
-      { expiresIn: '10h' }
+      { expiresIn: '7d' }
     );
     res.json({ token, role: rows[0].role, username: rows[0].username, id: rows[0].id });
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1395,14 +1395,13 @@ app.get('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_us
 // POST create a collab column
 app.post('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
   try {
-    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order } = req.body;
-    // col_type: 'input' | 'workflow'
+    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order, validation_config } = req.body;
     const { rows } = await db.query(`
-      INSERT INTO rh_collab_columns (report_id, label, col_type, inputter_ids, reviewer_ids, ref_column, col_order)
-      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *
+      INSERT INTO rh_collab_columns (report_id, label, col_type, inputter_ids, reviewer_ids, ref_column, col_order, validation_config)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *
     `, [req.params.id, label, col_type||'input',
         JSON.stringify(inputter_ids||[]), JSON.stringify(reviewer_ids||[]),
-        ref_column||null, col_order||0]);
+        ref_column||null, col_order||0, validation_config?JSON.stringify(validation_config):null]);
     res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
@@ -1410,14 +1409,17 @@ app.post('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_u
 // PUT update a collab column
 app.put('/api/reports/:id/collab-columns/:colId', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
   try {
-    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order } = req.body;
+    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order, validation_config } = req.body;
     const { rows } = await db.query(`
       UPDATE rh_collab_columns
-      SET label=$1, col_type=$2, inputter_ids=$3, reviewer_ids=$4, ref_column=$5, col_order=$6, updated_at=now()
-      WHERE id=$7 AND report_id=$8 RETURNING *
+      SET label=$1, col_type=$2, inputter_ids=$3, reviewer_ids=$4, ref_column=$5, col_order=$6,
+          validation_config=$7, updated_at=now()
+      WHERE id=$8 AND report_id=$9 RETURNING *
     `, [label, col_type||'input',
         JSON.stringify(inputter_ids||[]), JSON.stringify(reviewer_ids||[]),
-        ref_column||null, col_order||0, req.params.colId, req.params.id]);
+        ref_column||null, col_order||0,
+        validation_config?JSON.stringify(validation_config):null,
+        req.params.colId, req.params.id]);
     if (!rows[0]) return res.status(404).json({ error: 'Column not found' });
     res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
@@ -1501,12 +1503,38 @@ app.delete('/api/reports/:id/collab-cycles/:cycleId', auth(['admin']), async (re
 // GET export — workflow view as JSON for Excel download
 app.get('/api/reports/:id/collab-cycles/:cycleId/export', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
   try {
-    const [cols, vals, rows] = await Promise.all([
+    const [cols, vals, dataRows] = await Promise.all([
       db.query('SELECT * FROM rh_collab_columns WHERE report_id=$1 ORDER BY col_order ASC, id ASC', [req.params.id]),
-      db.query('SELECT v.*, u1.username as inputter_name, u2.username as reviewer_name FROM rh_collab_values v LEFT JOIN rh_users u1 ON u1.id=v.inputter_id LEFT JOIN rh_users u2 ON u2.id=v.reviewer_id WHERE v.cycle_id=$1', [req.params.cycleId]),
-      db.query('SELECT data FROM rh_rows WHERE report_id=$1 ORDER BY row_number', [req.params.id])
+      db.query(`SELECT v.*, u1.username as inputter_name, u2.username as reviewer_name
+        FROM rh_collab_values v
+        LEFT JOIN rh_users u1 ON u1.id=v.inputter_id
+        LEFT JOIN rh_users u2 ON u2.id=v.reviewer_id
+        WHERE v.cycle_id=$1`, [req.params.cycleId]),
+      db.query('SELECT row_data FROM rh_rows WHERE report_id=$1 ORDER BY id', [req.params.id])
     ]);
-    res.json({ columns: cols.rows, values: vals.rows, dataRows: rows.rows.map(r=>r.data) });
+    res.json({
+      columns: cols.rows,
+      values: vals.rows,
+      dataRows: dataRows.rows.map(r=>typeof r.row_data==='string'?JSON.parse(r.row_data):r.row_data)
+    });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// PATCH reopen a closed cycle (admin/subadmin)
+app.patch('/api/reports/:id/collab-cycles/:cycleId/reopen', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    // Ensure no other cycle is open for this report
+    const { rows: open } = await db.query(
+      `SELECT id FROM rh_collab_cycles WHERE report_id=$1 AND status='open'`, [req.params.id]
+    );
+    if (open.length) return res.status(409).json({ error: 'Another cycle is already open. Close it before reopening this one.' });
+    const { rows } = await db.query(
+      `UPDATE rh_collab_cycles SET status='open', closed_at=null, closed_by=null
+       WHERE id=$1 AND report_id=$2 AND status='closed' RETURNING *`,
+      [req.params.cycleId, req.params.id]
+    );
+    if (!rows[0]) return res.status(404).json({ error: 'Closed cycle not found' });
+    res.json(rows[0]);
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
