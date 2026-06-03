@@ -437,7 +437,7 @@ function parseXlsxBuffer(buf, sheetName, rangeOverride) {
     const r = XLSX.utils.decode_range(ws['!ref']);
     if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX.utils.encode_range(r); }
   }
-  const rawRows = XLSX.utils.sheet_to_json(ws, { defval: null, cellDates: true });
+  const rawRows = XLSX.utils.sheet_to_json(ws, { defval: null, cellDates: true, raw: true });
 
   // Normalize column header names — trim whitespace to match how frontend upload parses
   // This ensures SharePoint-fetched data has the same field names as the original upload
@@ -963,7 +963,7 @@ app.post('/api/reports/:id/refresh-url', auth(['admin']), async (req, res) => {
       const r = XLSX.utils.decode_range(ws['!ref']);
       if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX.utils.encode_range(r); }
     }
-    const rows = XLSX.utils.sheet_to_json(ws, { defval: null, cellDates: true });
+    const rows = XLSX.utils.sheet_to_json(ws, { defval: null, cellDates: true, raw: true });
     // Delete old rows and insert fresh
     const client = await db.connect();
     try {
@@ -1023,7 +1023,7 @@ app.post('/api/fetch-url', auth(['admin','user']), async (req, res) => {
             const rr = XLSX.utils.decode_range(ws0['!ref']);
             if (rr.e.r > 100000) { rr.e.r = 100000; ws0['!ref'] = XLSX.utils.encode_range(rr); }
           }
-          const rows0 = XLSX.utils.sheet_to_json(ws0, { defval: null, cellDates: true });
+          const rows0 = XLSX.utils.sheet_to_json(ws0, { defval: null, cellDates: true, raw: true });
           return res.json({ ok: true, rows: rows0, sheetNames: sheetNames0, rowCount: rows0.length });
         }
         // If API fails, fall through to direct download attempt
@@ -1121,7 +1121,7 @@ app.post('/api/fetch-url', auth(['admin','user']), async (req, res) => {
         const r = XLSX.utils.decode_range(ws['!ref']);
         if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX.utils.encode_range(r); }
       }
-      rows = XLSX.utils.sheet_to_json(ws, { defval: null, cellDates: true });
+      rows = XLSX.utils.sheet_to_json(ws, { defval: null, cellDates: true, raw: true });
     }
 
     res.json({ ok: true, rows, sheetNames, rowCount: rows.length });
