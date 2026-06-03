@@ -879,6 +879,46 @@ app.delete('/api/reports/:id', auth(['admin','subadmin']), async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
+// ── Update report rows only (preserves config/name/etc) ─────────────────────────
+app.patch('/api/reports/:id/rows', auth(['admin','subadmin']), async (req, res) => {
+  if (!await assertReportOwner(req, res)) return;
+  const client = await db.connect();
+  try {
+    const { rows, fields, numFields } = req.body;
+    if (!rows || !Array.isArray(rows)) return res.status(400).json({ error: 'rows required' });
+    await client.query('BEGIN');
+    // Update metadata
+    const nfArr = Array.isArray(numFields) ? numFields : [...(numFields||[])];
+    await client.query(
+      'UPDATE rh_reports SET num_fields=$1, row_count=$2, field_count=$3 WHERE id=$4',
+      [JSON.stringify(nfArr), rows.length, (fields||[]).length, req.params.id]
+    );
+    // Update dataset fields
+    await client.query(
+      'INSERT INTO rh_datasets (report_id, fields) VALUES ($1,$2) ON CONFLICT (report_id) DO UPDATE SET fields=$2',
+      [req.params.id, JSON.stringify(fields||[])]
+    );
+    // Replace rows
+    await client.query('DELETE FROM rh_rows WHERE report_id=$1', [req.params.id]);
+    if (rows.length > 0) {
+      const BATCH = 200;
+      for (let i = 0; i < rows.length; i += BATCH) {
+        const batch = rows.slice(i, i + BATCH);
+        const vals = batch.map((r,j) => `($1, $${j+2})`).join(',');
+        await client.query(
+          `INSERT INTO rh_rows (report_id, row_data) VALUES ${vals}`,
+          [req.params.id, ...batch.map(r => JSON.stringify(r))]
+        );
+      }
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, rowCount: rows.length });
+  } catch(e) {
+    await client.query('ROLLBACK').catch(()=>{});
+    res.status(500).json({ error: e.message });
+  } finally { client.release(); }
+});
+
 // ── Report access management ─────────────────────────────────────────────────────
 app.get('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
