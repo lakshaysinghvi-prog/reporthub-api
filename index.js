@@ -710,7 +710,8 @@ app.get('/api/reports', auth([]), async (req, res) => {
     }
 
     const { rows } = await db.query(q, params);
-    res.json(rows);
+    // Guard against null config — ensures frontend never receives config=null
+    res.json(rows.map(r => ({...r, config: r.config || {}})));
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -942,6 +943,7 @@ app.get('/api/reports/:id/data', auth([]), async (req, res) => {
     );
     res.json({
       fields: ds[0]?.fields || [],
+      config: rpt[0].config || {},
       numFields: rpt[0].num_fields || [],
       rows: dataRows.map(r => r.row_data)
     });
