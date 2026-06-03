@@ -829,8 +829,9 @@ app.patch('/api/reports/:id/config', auth(['admin','subadmin']), async (req, res
     const vals = [JSON.stringify(config)];
     if (nfArr) { cols.push(`num_fields=$${vals.length+1}`); vals.push(JSON.stringify(nfArr)); }
     if (name) { cols.push(`name=$${vals.length+1}`); vals.push(name); }
-    cols.push(`WHERE id=$${vals.length+1}`); vals.push(req.params.id);
-    await db.query(`UPDATE rh_reports SET ${cols.join(', ')}`, vals);
+    // WHERE clause must NOT be in the SET cols array — add it separately
+    vals.push(req.params.id);
+    await db.query(`UPDATE rh_reports SET ${cols.join(', ')} WHERE id=$${vals.length}`, vals);
     res.json({ id: req.params.id });
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
