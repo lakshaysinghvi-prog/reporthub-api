@@ -457,13 +457,18 @@ function parseXlsxBuffer(buf, sheetName, rangeOverride) {
     : rawRows;
 
   // Detect numeric fields (>50% numeric values in sample)
+  // Strip currency symbols and thousand-separators before testing so that
+  // Indian-formatted values like "₹84,00,00,000" or "1,40,00,000" are detected.
   const sample = rows.slice(0, 50);
   const numFields = fields.filter(f => {
     const vals = sample.map(r => r[f]).filter(v => v !== null && v !== undefined && v !== '');
     if (!vals.length) return false;
-    const numCount = vals.filter(v =>
-      typeof v === 'number' || (typeof v === 'string' && !isNaN(parseFloat(v)) && isFinite(v))
-    ).length;
+    const numCount = vals.filter(v => {
+      if (typeof v === 'number') return true;
+      if (typeof v !== 'string') return false;
+      const stripped = v.trim().replace(/[$,₹₹\s]/g, '');
+      return stripped !== '' && !isNaN(parseFloat(stripped)) && isFinite(stripped);
+    }).length;
     return numCount / vals.length > 0.5;
   });
 
