@@ -13,6 +13,41 @@ app.use(express.json({ limit: '100mb' }));
 
 const db = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
+// ── Startup migrations (idempotent) ────────────────────────────────────────────
+(async()=>{
+  try{
+    await db.query(`ALTER TABLE rh_reports ADD COLUMN IF NOT EXISTS collab_enabled BOOLEAN DEFAULT FALSE`);
+    await db.query(`CREATE TABLE IF NOT EXISTS rh_collab_columns (
+      id SERIAL PRIMARY KEY, report_id TEXT NOT NULL, label TEXT NOT NULL,
+      col_type TEXT NOT NULL DEFAULT 'input', inputter_ids JSONB DEFAULT '[]',
+      reviewer_ids JSONB DEFAULT '[]', ref_column TEXT, col_order INT DEFAULT 0,
+      validation_config JSONB DEFAULT NULL, created_at TIMESTAMPTZ DEFAULT now(),
+      updated_at TIMESTAMPTZ DEFAULT now())`);
+    await db.query(`CREATE TABLE IF NOT EXISTS rh_collab_cycles (
+      id SERIAL PRIMARY KEY, report_id TEXT NOT NULL, period_label TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'open', opened_by INT,
+      history_viewer_ids JSONB DEFAULT '[]', closed_at TIMESTAMPTZ, closed_by INT,
+      created_at TIMESTAMPTZ DEFAULT now())`);
+    await db.query(`CREATE TABLE IF NOT EXISTS rh_collab_values (
+      id SERIAL PRIMARY KEY, cycle_id INT NOT NULL, report_id TEXT NOT NULL,
+      row_key TEXT NOT NULL, col_id INT NOT NULL, value NUMERIC, remarks TEXT,
+      status TEXT NOT NULL DEFAULT 'pending', inputter_id INT, reviewer_id INT,
+      reviewer_remarks TEXT, reviewer_value NUMERIC DEFAULT NULL,
+      reviewed_at TIMESTAMPTZ, updated_at TIMESTAMPTZ DEFAULT now(),
+      UNIQUE(cycle_id, row_key, col_id))`);
+    await db.query(`CREATE TABLE IF NOT EXISTS rh_collab_audit (
+      id SERIAL PRIMARY KEY, cycle_id INT NOT NULL, report_id TEXT NOT NULL,
+      row_key TEXT NOT NULL, col_id INT NOT NULL, actor_id INT, action TEXT NOT NULL,
+      value NUMERIC, remarks TEXT, created_at TIMESTAMPTZ DEFAULT now())`);
+    await db.query(`ALTER TABLE rh_collab_values DROP CONSTRAINT IF EXISTS rh_collab_values_status_check`);
+    await db.query(`ALTER TABLE rh_collab_values ADD CONSTRAINT rh_collab_values_status_check
+      CHECK (status IN ('pending','submitted','approved','rejected','hold','modified'))`);
+    await db.query(`ALTER TABLE rh_collab_columns ADD COLUMN IF NOT EXISTS validation_config JSONB DEFAULT NULL`);
+    await db.query(`ALTER TABLE rh_collab_values ADD COLUMN IF NOT EXISTS reviewer_value NUMERIC DEFAULT NULL`);
+    console.log('Migrations OK');
+  }catch(e){console.error('Migration error:',e.message);}
+})();
+
 // ── Auth middleware ─────────────────────────────────────────────────────────────
 const auth = (roles = []) => (req, res, next) => {
   try {
@@ -689,14 +724,14 @@ app.get('/api/reports', auth([]), async (req, res) => {
 
     if (role === 'admin') {
       // Super admin: see ALL reports
-      q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
+      q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published, r.collab_enabled,
              r.row_count, r.field_count, r.created_at, r.created_by,
              u.username AS created_by_username
            FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
            ORDER BY r.created_at DESC`;
     } else if (role === 'subadmin') {
       // Sub-admin: see only their own reports
-      q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
+      q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published, r.collab_enabled,
              r.row_count, r.field_count, r.created_at, r.created_by,
              u.username AS created_by_username
            FROM rh_reports r LEFT JOIN rh_users u ON u.id=r.created_by
@@ -704,8 +739,7 @@ app.get('/api/reports', auth([]), async (req, res) => {
       params = [userId];
     } else {
       // User: see only published reports explicitly assigned to them
-      // (if a report has NO access rows, it is NOT visible to regular users unless assigned)
-      q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published,
+      q = `SELECT r.id, r.name, r.config, r.card_fields, r.is_published, r.collab_enabled,
              r.row_count, r.field_count, r.created_at
            FROM rh_reports r
            INNER JOIN rh_report_access ra ON ra.report_id = r.id
@@ -1179,6 +1213,227 @@ app.post('/api/fetch-url', auth(['admin','user']), async (req, res) => {
   }
 });
 
+
+// ── Phase 3: Collaborative Workflow ──────────────────────────────────────────────
+
+// Lightweight field-name list (for collab setup dropdowns)
+app.get('/api/reports/:id/fields', auth([]), async (req, res) => {
+  try {
+    const { rows: ds } = await db.query('SELECT fields FROM rh_datasets WHERE report_id=$1', [req.params.id]);
+    if (ds[0]?.fields) {
+      const f = Array.isArray(ds[0].fields) ? ds[0].fields : (typeof ds[0].fields==='string'?JSON.parse(ds[0].fields):[]);
+      if (f.length>0) return res.json(f);
+    }
+    const { rows: sample } = await db.query('SELECT row_data FROM rh_rows WHERE report_id=$1 LIMIT 1', [req.params.id]);
+    if (sample[0]) {
+      const rd = typeof sample[0].row_data==='string'?JSON.parse(sample[0].row_data):sample[0].row_data;
+      return res.json(Object.keys(rd||{}));
+    }
+    const { rows: rpt } = await db.query('SELECT config FROM rh_reports WHERE id=$1', [req.params.id]);
+    if (rpt[0]) {
+      const cfg = typeof rpt[0].config==='string'?JSON.parse(rpt[0].config):(rpt[0].config||{});
+      const fields = new Set();
+      const extract = c => ['rows','columns','values','filters'].forEach(k=>(c[k]||[]).forEach(x=>x.field&&fields.add(x.field)));
+      if (cfg.tabs) cfg.tabs.forEach(t=>extract(t.config||{}));
+      extract(cfg);
+      return res.json([...fields]);
+    }
+    res.json([]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Toggle collab mode
+app.patch('/api/reports/:id/collab-toggle', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { enabled } = req.body;
+    await db.query('UPDATE rh_reports SET collab_enabled=$1 WHERE id=$2', [!!enabled, req.params.id]);
+    res.json({ ok: true, collab_enabled: !!enabled });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Collab columns
+app.get('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM rh_collab_columns WHERE report_id=$1 ORDER BY col_order ASC, id ASC', [req.params.id]);
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/reports/:id/collab-columns', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order, validation_config } = req.body;
+    const { rows } = await db.query(`INSERT INTO rh_collab_columns (report_id,label,col_type,inputter_ids,reviewer_ids,ref_column,col_order,validation_config) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [req.params.id,label,col_type||'input',JSON.stringify(inputter_ids||[]),JSON.stringify(reviewer_ids||[]),ref_column||null,col_order||0,validation_config?JSON.stringify(validation_config):null]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/reports/:id/collab-columns/:colId', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { label, col_type, inputter_ids, reviewer_ids, ref_column, col_order, validation_config } = req.body;
+    const { rows } = await db.query(`UPDATE rh_collab_columns SET label=$1,col_type=$2,inputter_ids=$3,reviewer_ids=$4,ref_column=$5,col_order=$6,validation_config=$7,updated_at=now() WHERE id=$8 AND report_id=$9 RETURNING *`,
+      [label,col_type||'input',JSON.stringify(inputter_ids||[]),JSON.stringify(reviewer_ids||[]),ref_column||null,col_order||0,validation_config?JSON.stringify(validation_config):null,req.params.colId,req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Column not found' });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/reports/:id/collab-columns/:colId', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    await db.query('DELETE FROM rh_collab_columns WHERE id=$1 AND report_id=$2', [req.params.colId, req.params.id]);
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Collab cycles
+app.get('/api/reports/:id/collab-cycles', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM rh_collab_cycles WHERE report_id=$1 ORDER BY created_at DESC', [req.params.id]);
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.post('/api/reports/:id/collab-cycles', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { period_label, history_viewer_ids } = req.body;
+    if (!period_label) return res.status(400).json({ error: 'period_label required' });
+    const { rows } = await db.query(`INSERT INTO rh_collab_cycles (report_id,period_label,status,history_viewer_ids,opened_by) VALUES ($1,$2,'open',$3,$4) RETURNING *`,
+      [req.params.id, period_label, JSON.stringify(history_viewer_ids||[]), req.user.id]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/reports/:id/collab-cycles/:cycleId/close', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { rows } = await db.query(`UPDATE rh_collab_cycles SET status='closed',closed_at=now(),closed_by=$1 WHERE id=$2 AND report_id=$3 AND status='open' RETURNING *`, [req.user.id, req.params.cycleId, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Open cycle not found' });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/reports/:id/collab-cycles/:cycleId/rename', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { label } = req.body;
+    if (!label?.trim()) return res.status(400).json({ error: 'Label required' });
+    const { rows } = await db.query(`UPDATE rh_collab_cycles SET period_label=$1 WHERE id=$2 AND report_id=$3 RETURNING *`, [label.trim(), req.params.cycleId, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Cycle not found' });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.delete('/api/reports/:id/collab-cycles/:cycleId', auth(['admin']), async (req, res) => {
+  try {
+    const { rows } = await db.query(`DELETE FROM rh_collab_cycles WHERE id=$1 AND report_id=$2 RETURNING id,period_label`, [req.params.cycleId, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Cycle not found' });
+    res.json({ deleted: true, ...rows[0] });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/reports/:id/collab-cycles/:cycleId/reopen', auth(['admin','subadmin','subadmin_user']), async (req, res) => {
+  try {
+    const { rows } = await db.query(`UPDATE rh_collab_cycles SET status='open',closed_at=null,closed_by=null WHERE id=$1 AND report_id=$2 AND status='closed' RETURNING *`, [req.params.cycleId, req.params.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Closed cycle not found' });
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.get('/api/reports/:id/collab-cycles/:cycleId/export', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const [cols, vals, dataRows] = await Promise.all([
+      db.query('SELECT * FROM rh_collab_columns WHERE report_id=$1 ORDER BY col_order ASC, id ASC', [req.params.id]),
+      db.query(`SELECT v.*,u1.username as inputter_name,u2.username as reviewer_name FROM rh_collab_values v LEFT JOIN rh_users u1 ON u1.id=v.inputter_id LEFT JOIN rh_users u2 ON u2.id=v.reviewer_id WHERE v.cycle_id=$1`, [req.params.cycleId]),
+      db.query('SELECT row_data FROM rh_rows WHERE report_id=$1 ORDER BY id', [req.params.id])
+    ]);
+    res.json({ columns: cols.rows, values: vals.rows, dataRows: dataRows.rows.map(r=>typeof r.row_data==='string'?JSON.parse(r.row_data):r.row_data) });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Collab values
+app.get('/api/reports/:id/collab-cycles/:cycleId/values', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { rows } = await db.query('SELECT * FROM rh_collab_values WHERE cycle_id=$1 ORDER BY row_key, col_id', [req.params.cycleId]);
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.put('/api/reports/:id/collab-cycles/:cycleId/values', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { row_key, col_id, value, remarks } = req.body;
+    if (row_key===undefined||col_id===undefined) return res.status(400).json({ error: 'row_key and col_id required' });
+    const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
+    if (!cyc[0]||cyc[0].status!=='open') return res.status(409).json({ error: 'Cycle is closed' });
+    const { rows: col } = await db.query('SELECT col_type,inputter_ids FROM rh_collab_columns WHERE id=$1', [col_id]);
+    if (!col[0]) return res.status(404).json({ error: 'Column not found' });
+    const isBuilder = ['admin','subadmin','subadmin_user'].includes(req.user.role);
+    const inputterIds = Array.isArray(col[0].inputter_ids)?col[0].inputter_ids:JSON.parse(col[0].inputter_ids||'[]');
+    if (!isBuilder&&!inputterIds.includes(req.user.id)) return res.status(403).json({ error: 'Not assigned as inputter' });
+    const newStatus = col[0].col_type==='input'?'approved':'pending';
+    const { rows } = await db.query(`INSERT INTO rh_collab_values (cycle_id,report_id,row_key,col_id,value,remarks,status,inputter_id,updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,now()) ON CONFLICT (cycle_id,row_key,col_id) DO UPDATE SET value=$5,remarks=$6,status=CASE WHEN rh_collab_values.status IN ('approved','rejected') THEN 'pending' ELSE $7 END,inputter_id=$8,updated_at=now() RETURNING *`,
+      [req.params.cycleId,req.params.id,String(row_key),col_id,value,remarks||null,newStatus,req.user.id]);
+    await db.query(`INSERT INTO rh_collab_audit (cycle_id,report_id,row_key,col_id,actor_id,action,value,remarks) VALUES ($1,$2,$3,$4,$5,'save',$6,$7)`,
+      [req.params.cycleId,req.params.id,String(row_key),col_id,req.user.id,value,remarks||null]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/reports/:id/collab-cycles/:cycleId/values/submit', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { row_key, col_id } = req.body;
+    const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
+    if (!cyc[0]||cyc[0].status!=='open') return res.status(409).json({ error: 'Cycle is closed' });
+    const { rows } = await db.query(`UPDATE rh_collab_values SET status='submitted',updated_at=now() WHERE cycle_id=$1 AND row_key=$2 AND col_id=$3 AND inputter_id=$4 AND status='pending' RETURNING *`,
+      [req.params.cycleId,String(row_key),col_id,req.user.id]);
+    if (!rows[0]) return res.status(404).json({ error: 'Value not found or not pending' });
+    await db.query(`INSERT INTO rh_collab_audit (cycle_id,report_id,row_key,col_id,actor_id,action,value,remarks) VALUES ($1,$2,$3,$4,$5,'submit',$6,null)`,
+      [req.params.cycleId,req.params.id,String(row_key),col_id,req.user.id,rows[0].value]);
+    res.json(rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+app.patch('/api/reports/:id/collab-cycles/:cycleId/values/review', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { row_key, col_id, action, remarks, modified_value } = req.body;
+    if (!['approved','rejected','hold','modified'].includes(action)) return res.status(400).json({ error: 'action must be approved/rejected/hold/modified' });
+    const { rows: cyc } = await db.query("SELECT status FROM rh_collab_cycles WHERE id=$1", [req.params.cycleId]);
+    if (!cyc[0]||cyc[0].status!=='open') return res.status(409).json({ error: 'Cycle is closed' });
+    const { rows: col } = await db.query('SELECT reviewer_ids FROM rh_collab_columns WHERE id=$1', [col_id]);
+    if (!col[0]) return res.status(404).json({ error: 'Column not found' });
+    const isBuilder = ['admin','subadmin'].includes(req.user.role);
+    const reviewerIds = Array.isArray(col[0].reviewer_ids)?col[0].reviewer_ids:JSON.parse(col[0].reviewer_ids||'[]');
+    if (!isBuilder&&!reviewerIds.includes(req.user.id)) return res.status(403).json({ error: 'Not assigned as reviewer' });
+    let finalAction=action, finalValue=null;
+    if (action==='modified'&&modified_value!==undefined&&modified_value!==null) {
+      finalValue=parseFloat(modified_value)||0;
+      if (finalValue===0) finalAction='rejected';
+    }
+    let updateResult;
+    if (finalValue!==null&&finalAction==='modified') {
+      updateResult=await db.query(`UPDATE rh_collab_values SET status=$1,reviewer_id=$2,reviewer_remarks=$3,reviewed_at=now(),updated_at=now(),reviewer_value=$7 WHERE cycle_id=$4 AND row_key=$5 AND col_id=$6 AND status='submitted' RETURNING *`,
+        [finalAction,req.user.id,remarks||null,req.params.cycleId,String(row_key),col_id,finalValue]);
+    } else {
+      updateResult=await db.query(`UPDATE rh_collab_values SET status=$1,reviewer_id=$2,reviewer_remarks=$3,reviewed_at=now(),updated_at=now() WHERE cycle_id=$4 AND row_key=$5 AND col_id=$6 AND status='submitted' RETURNING *`,
+        [finalAction,req.user.id,remarks||null,req.params.cycleId,String(row_key),col_id]);
+    }
+    if (!updateResult.rows[0]) return res.status(404).json({ error: 'Value not found or not submitted' });
+    await db.query(`INSERT INTO rh_collab_audit (cycle_id,report_id,row_key,col_id,actor_id,action,value,remarks) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [req.params.cycleId,req.params.id,String(row_key),col_id,req.user.id,finalAction,updateResult.rows[0].value,remarks||null]);
+    res.json(updateResult.rows[0]);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// Audit trail
+app.get('/api/reports/:id/collab-cycles/:cycleId/audit', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { row_key } = req.query;
+    let q='SELECT a.*,u.username FROM rh_collab_audit a LEFT JOIN rh_users u ON u.id=a.actor_id WHERE a.cycle_id=$1';
+    const params=[req.params.cycleId];
+    if (row_key) { q+=' AND a.row_key=$2'; params.push(String(row_key)); }
+    q+=' ORDER BY a.created_at ASC';
+    const { rows } = await db.query(q, params);
+    res.json(rows);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// History
+app.get('/api/reports/:id/collab-history', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
+  try {
+    const { rows: cycles } = await db.query("SELECT * FROM rh_collab_cycles WHERE report_id=$1 AND status='closed' ORDER BY closed_at DESC", [req.params.id]);
+    const filtered = cycles.filter(c => {
+      if (['admin','subadmin'].includes(req.user.role)) return true;
+      const ids = Array.isArray(c.history_viewer_ids)?c.history_viewer_ids:JSON.parse(c.history_viewer_ids||'[]');
+      return ids.includes(req.user.id);
+    });
+    res.json(filtered);
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
 
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => console.log(`ReportHub API running on port ${PORT}`));
