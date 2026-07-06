@@ -1,6 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const { Pool } = require('pg');
+const Cursor = require('pg-cursor');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const XLSX = require('xlsx');
@@ -702,18 +703,47 @@ app.get('/api/public/reports', async (req, res) => {
 
 // ── Public: rows for a published report (no auth) ───────────────────────────────
 app.get('/api/public/reports/:id/data', async (req, res) => {
+  const client = await db.connect();
   try {
-    const { rows: rpts } = await db.query(
+    const { rows: rpts } = await client.query(
       'SELECT is_published FROM rh_reports WHERE id=$1', [req.params.id]);
-    if (!rpts[0] || !rpts[0].is_published)
+    if (!rpts[0] || !rpts[0].is_published) {
+      client.release();
       return res.status(403).json({ error: 'Report not found or not published' });
-    const { rows } = await db.query(
-      'SELECT row_data FROM rh_rows WHERE report_id=$1 ORDER BY id', [req.params.id]);
-    const allRows = rows.map(r => typeof r.row_data === 'string' ? JSON.parse(r.row_data) : r.row_data);
-    const fields = allRows.length ? Object.keys(allRows[0]) : [];
-    const numFields = fields.filter(f => typeof allRows[0]?.[f] === 'number');
-    res.json({ rows: allRows, fields, numFields });
-  } catch(e) { res.status(500).json({ error: e.message }); }
+    }
+    res.setHeader('Content-Type', 'application/json');
+    res.write('{"rows":[');
+    const cursor = client.query(new Cursor(
+      'SELECT row_data FROM rh_rows WHERE report_id=$1 ORDER BY id', [req.params.id]
+    ));
+    let first = true;
+    let firstRow = null;
+    try {
+      while (true) {
+        const batch = await new Promise((resolve, reject) =>
+          cursor.read(500, (err, rows) => err ? reject(err) : resolve(rows))
+        );
+        if (batch.length === 0) break;
+        for (const row of batch) {
+          const rd = typeof row.row_data === 'string' ? JSON.parse(row.row_data) : row.row_data;
+          if (!first) res.write(',');
+          if (first) { firstRow = rd; first = false; }
+          res.write(JSON.stringify(rd));
+        }
+      }
+    } finally {
+      await new Promise(r => cursor.close(r));
+      client.release();
+    }
+    const fields = firstRow ? Object.keys(firstRow) : [];
+    const numFields = fields.filter(f => typeof firstRow?.[f] === 'number');
+    res.write('],"fields":' + JSON.stringify(fields) + ',"numFields":' + JSON.stringify(numFields) + '}');
+    res.end();
+  } catch(e) {
+    try { client.release(); } catch {}
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+    else res.end();
+  }
 });
 
 app.get('/api/reports', auth([]), async (req, res) => {
@@ -1009,25 +1039,48 @@ app.patch('/api/reports/:id/unpublish', auth(['admin','subadmin']), async (req, 
 
 // ── Report data (rows + fields) ───────────────────────────────────────────────
 app.get('/api/reports/:id/data', auth([]), async (req, res) => {
+  const client = await db.connect();
   try {
-    const { rows: rpt } = await db.query(
+    const { rows: rpt } = await client.query(
       'SELECT is_published, num_fields FROM rh_reports WHERE id=$1', [req.params.id]
     );
-    if (!rpt[0]) return res.status(404).json({ error: 'Not found' });
-    if (!rpt[0].is_published && req.user.role !== 'admin' && req.user.role !== 'subadmin')
+    if (!rpt[0]) { client.release(); return res.status(404).json({ error: 'Not found' }); }
+    if (!rpt[0].is_published && req.user.role !== 'admin' && req.user.role !== 'subadmin') {
+      client.release();
       return res.status(403).json({ error: 'Not published' });
-
-    const { rows: ds } = await db.query('SELECT fields FROM rh_datasets WHERE report_id=$1', [req.params.id]);
-    const { rows: dataRows } = await db.query(
+    }
+    const { rows: ds } = await client.query('SELECT fields FROM rh_datasets WHERE report_id=$1', [req.params.id]);
+    const fields = ds[0]?.fields || [];
+    const numFields = rpt[0].num_fields || [];
+    res.setHeader('Content-Type', 'application/json');
+    res.write('{"fields":' + JSON.stringify(fields) + ',"config":{},"numFields":' + JSON.stringify(numFields) + ',"rows":[');
+    const cursor = client.query(new Cursor(
       'SELECT row_data FROM rh_rows WHERE report_id=$1 ORDER BY id', [req.params.id]
-    );
-    res.json({
-      fields: ds[0]?.fields || [],
-      config: rpt[0].config || {},
-      numFields: rpt[0].num_fields || [],
-      rows: dataRows.map(r => r.row_data)
-    });
-  } catch (e) { res.status(500).json({ error: e.message }); }
+    ));
+    let first = true;
+    try {
+      while (true) {
+        const batch = await new Promise((resolve, reject) =>
+          cursor.read(500, (err, rows) => err ? reject(err) : resolve(rows))
+        );
+        if (batch.length === 0) break;
+        for (const row of batch) {
+          if (!first) res.write(',');
+          first = false;
+          res.write(typeof row.row_data === 'string' ? row.row_data : JSON.stringify(row.row_data));
+        }
+      }
+    } finally {
+      await new Promise(r => cursor.close(r));
+      client.release();
+    }
+    res.write(']}');
+    res.end();
+  } catch(e) {
+    try { client.release(); } catch {}
+    if (!res.headersSent) res.status(500).json({ error: e.message });
+    else res.end();
+  }
 });
 
 // ── URL refresh (re-download Excel from a URL and re-import) ──────────────────
