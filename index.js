@@ -445,7 +445,6 @@ async function downloadWithMicrosoftGraph(userId, shareUrl) {
 
   // Strategy 1: custom app credentials (client_credentials — no user login needed)
   if (creds.isCustom && creds.clientId && creds.clientSecret) {
-    let appTokenErr = null;
     try {
       const appToken = await getMsAppToken(creds);
       const resp = await fetch(sharesUrl, {
@@ -453,27 +452,20 @@ async function downloadWithMicrosoftGraph(userId, shareUrl) {
         redirect: 'follow',
       });
       if (resp.ok) return await resp.arrayBuffer();
-      const errBody = await resp.text().catch(()=>'');
-      appTokenErr = `App credentials returned HTTP ${resp.status}: ${errBody.slice(0,300)}`;
-      console.log('[fetch-url] Strategy 1 failed:', appTokenErr);
+      // Parse the Graph error for a useful message
+      const errJson = await resp.json().catch(()=>null);
+      const graphMsg = errJson?.error?.message || `HTTP ${resp.status}`;
+      console.log('[fetch-url] App creds shares API failed:', resp.status, graphMsg);
+      // Surface the real error — NOT a generic NEEDS_AUTH
+      throw new Error(`SharePoint access failed (HTTP ${resp.status}): ${graphMsg}. In Azure Portal → App Registrations → API Permissions, make sure Files.Read.All (Application) is granted and admin-consented in addition to Sites.Read.All.`);
     } catch(e) {
-      appTokenErr = `App credentials error: ${e.message}`;
-      console.log('[fetch-url] Strategy 1 error:', appTokenErr);
+      // If the error is one we threw above (real Graph error), re-throw it directly
+      if (!e.message.startsWith('App token failed') && !e.message.includes('NEEDS_AUTH')) {
+        throw e;
+      }
+      console.log('[fetch-url] App token error:', e.message);
     }
-    // If app creds are set but failed, skip user OAuth and surface the real error
-    // (user OAuth would give a misleading "expired" message)
-    const token = await getValidAccessToken(userId, 'microsoft');
-    if (!token) {
-      throw new Error(`NEEDS_AUTH:microsoft|${appTokenErr}`);
-    }
-    // Have a user token too — try it before giving up
-    const resp2 = await fetch(sharesUrl, {
-      headers: { Authorization: `Bearer ${token}` },
-      redirect: 'follow',
-    });
-    if (resp2.ok) return await resp2.arrayBuffer();
-    if (resp2.status === 401) throw new Error('NEEDS_AUTH:microsoft');
-    throw new Error(`Microsoft Graph error: HTTP ${resp2.status} (app creds also failed: ${appTokenErr})`);
+    // App token acquisition failed — fall through to user OAuth
   }
 
   // No custom credentials — Strategy 2 only: user OAuth token
