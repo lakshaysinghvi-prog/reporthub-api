@@ -86,7 +86,7 @@ app.get('/api/debug/ms-auth', async (req, res) => {
       try {
         const tok = await getMsAppToken(creds);
         result.appTokenOk = true;
-        // Quick sanity check: list sites
+        // Test 1: Sites API
         const testR = await fetch('https://graph.microsoft.com/v1.0/sites?search=*&$top=1', {
           headers: { Authorization: 'Bearer ' + tok }
         });
@@ -94,6 +94,18 @@ app.get('/api/debug/ms-auth', async (req, res) => {
         result.graphSitesStatus = testR.status;
         result.graphSitesOk = testR.ok;
         if (!testR.ok) result.graphSitesError = testBody.error?.message || JSON.stringify(testBody);
+        // Test 2: if a shareUrl is passed as query param, test it via the shares API
+        if (req.query.url) {
+          const encoded = Buffer.from(req.query.url).toString('base64')
+            .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+          const sharesUrl = `https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem`;
+          const sharesR = await fetch(sharesUrl, { headers: { Authorization: 'Bearer ' + tok } });
+          const sharesBody = await sharesR.json().catch(()=>({}));
+          result.sharesApiStatus = sharesR.status;
+          result.sharesApiOk = sharesR.ok;
+          result.sharesApiName = sharesBody.name || null;
+          if (!sharesR.ok) result.sharesApiError = sharesBody.error?.message || JSON.stringify(sharesBody).slice(0,300);
+        }
       } catch(e) {
         result.appTokenError = e.message;
       }
