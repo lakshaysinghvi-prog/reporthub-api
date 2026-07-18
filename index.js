@@ -391,10 +391,12 @@ async function getMsAppToken(creds) {
 }
 
 async function downloadWithMicrosoftGraph(userId, shareUrl) {
-  // Strategy 1: try custom app credentials (client_credentials, no user login needed)
-  // This works for SharePoint when Sites.Read.All application permission is granted
   const creds = await getEffectiveCreds('microsoft');
-  if (creds.isCustom && creds.tenantId && creds.tenantId !== 'common') {
+
+  // Strategy 1: custom app credentials (client_credentials — no user login needed)
+  // Try whenever custom credentials are saved, regardless of tenantId value.
+  // getMsAppToken will throw if the tenant/creds are invalid; the catch falls through.
+  if (creds.isCustom && creds.clientId && creds.clientSecret) {
     try {
       const appToken = await getMsAppToken(creds);
       const encoded = Buffer.from(shareUrl).toString('base64')
@@ -405,13 +407,15 @@ async function downloadWithMicrosoftGraph(userId, shareUrl) {
         redirect: 'follow',
       });
       if (resp.ok) return await resp.arrayBuffer();
-      console.log('App token fetch returned', resp.status, '— trying user token');
+      // 403 usually means missing Files.Read.All permission in addition to Sites.Read.All
+      const errBody = await resp.text().catch(()=>'');
+      console.log('App token fetch returned', resp.status, errBody.slice(0,200), '— trying user token');
     } catch(e) {
       console.log('App token strategy failed:', e.message, '— falling back to user token');
     }
   }
 
-  // Strategy 2: user OAuth token (from Connect flow)
+  // Strategy 2: user OAuth token (from the Connect Microsoft button)
   const token = await getValidAccessToken(userId, 'microsoft');
   if (!token) throw new Error('NEEDS_AUTH:microsoft');
 
