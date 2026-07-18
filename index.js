@@ -614,12 +614,14 @@ app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), as
         return res.json({ ok: true, ...result, rowCount: result.rows.length });
       } catch(e) {
         if (e.message.startsWith('NEEDS_AUTH:')) {
-          // Extract the real app-creds error if present (format: NEEDS_AUTH:microsoft|<detail>)
-          const detail = e.message.includes('|') ? e.message.split('|').slice(1).join('|') : null;
-          const message = detail
-            ? `App credentials failed (${detail}). Connect your Microsoft account as a fallback.`
-            : 'Connect your Microsoft account in the Upload tab to access OneDrive/SharePoint files.';
-          return res.status(401).json({ error: 'needs_auth', provider: 'microsoft', message });
+          return res.status(401).json({ error: 'needs_auth', provider: 'microsoft',
+            message: 'Connect your Microsoft account in the Upload tab to access OneDrive/SharePoint files.' });
+        }
+        // Real Graph error (e.g. 403 missing permissions) — return it directly.
+        // Don't try the public fallback; if app credentials are configured the file
+        // is almost certainly private and the public path will just return a login page.
+        if (e.message.startsWith('SharePoint access failed')) {
+          return res.status(400).json({ error: e.message });
         }
         console.log('Graph API failed, trying public fallback:', e.message);
       }
