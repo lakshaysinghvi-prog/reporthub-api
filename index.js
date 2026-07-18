@@ -458,12 +458,13 @@ async function downloadWithGoogleDrive(userId, shareUrl) {
   return await resp.arrayBuffer();
 }
 
-const MAX_XLSX_BYTES = 25 * 1024 * 1024; // 25 MB — XLSX.read is ~5-10x memory; beyond this risks OOM
+const MAX_XLSX_BYTES = 20 * 1024 * 1024; // 20 MB compressed — XLSX expands ~5-10x in RAM
+const MAX_SHEET_CELLS = 2_000_000;        // ~50k rows × 40 cols — beyond this sheet_to_json OOMs
 function parseXlsxBuffer(buf, sheetName, rangeOverride) {
   if (buf.byteLength > MAX_XLSX_BYTES) {
     throw new Error(
-      `File is too large to process (${Math.round(buf.byteLength / 1024 / 1024)} MB). ` +
-      `Maximum is 25 MB. Please export only the required sheet or reduce the row count.`
+      `File is too large to refresh via link (${Math.round(buf.byteLength / 1024 / 1024)} MB, max 20 MB). ` +
+      `Export only the required sheet, or upload the file directly instead of using a link.`
     );
   }
   let wb;
@@ -479,6 +480,19 @@ function parseXlsxBuffer(buf, sheetName, rangeOverride) {
   } else if (ws['!ref']) {
     const r = XLSX.utils.decode_range(ws['!ref']);
     if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX.utils.encode_range(r); }
+  }
+  // Check sheet dimensions before materialising rows — sheet_to_json is the real memory hog
+  if (ws['!ref']) {
+    const dim = XLSX.utils.decode_range(ws['!ref']);
+    const cells = (dim.e.r - dim.s.r) * (dim.e.c - dim.s.c + 1);
+    if (cells > MAX_SHEET_CELLS) {
+      const rows = dim.e.r - dim.s.r;
+      const cols = dim.e.c - dim.s.c + 1;
+      throw new Error(
+        `Sheet is too large to refresh via link (${rows.toLocaleString()} rows × ${cols} columns). ` +
+        `Please reduce to under 50,000 rows, or upload the file directly.`
+      );
+    }
   }
   const rawRows = XLSX.utils.sheet_to_json(ws, { defval: null, cellDates: true, raw: true });
 
