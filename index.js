@@ -437,44 +437,103 @@ async function getMsAppToken(creds) {
   return data.access_token;
 }
 
+// Download a file from SharePoint using the Graph API "drives" path approach.
+// Works for direct SharePoint file URLs (e.g. /sites/{site}/Shared Documents/{path}).
+async function downloadViaSharePointPath(appToken, fileUrl) {
+  const u = new URL(fileUrl.split('?')[0]);
+  const hostname = u.hostname; // sprindia.sharepoint.com
+  const parts = decodeURIComponent(u.pathname).split('/').filter(Boolean);
+  // Expect: sites / {siteName} / {library} / ... / file.ext
+  const sitesIdx = parts.indexOf('sites');
+  if (sitesIdx < 0 || !parts[sitesIdx + 1]) throw new Error('Cannot parse site name from URL');
+  const siteName = parts[sitesIdx + 1];
+  // Everything after /sites/{siteName}/ is the library + file path
+  const fullPath = parts.slice(sitesIdx + 2).join('/'); // e.g. "Shared Documents/Reports/file.xlsx"
+
+  // Fetch the site's drives to find which library this path belongs to
+  const drivesResp = await fetch(
+    `https://graph.microsoft.com/v1.0/sites/${hostname}:/sites/${siteName}:/drives`,
+    { headers: { Authorization: `Bearer ${appToken}` } }
+  );
+  if (!drivesResp.ok) {
+    const e = await drivesResp.json().catch(()=>({}));
+    throw new Error(`Cannot list drives: HTTP ${drivesResp.status} — ${e?.error?.message||''}`);
+  }
+  const { value: drives } = await drivesResp.json();
+
+  // Find which drive's name matches the first path component (the library name)
+  const libraryName = parts[sitesIdx + 2] || '';
+  const drive = drives.find(d =>
+    d.name.toLowerCase() === libraryName.toLowerCase() ||
+    (d.webUrl||'').toLowerCase().includes(encodeURIComponent(libraryName).toLowerCase())
+  ) || drives[0]; // fall back to default drive
+
+  const driveId = drive.id;
+  // Strip the library name from the path to get the path INSIDE the drive
+  const pathInDrive = parts.slice(sitesIdx + 3).join('/'); // after /sites/{site}/{library}/
+
+  const fileResp = await fetch(
+    `https://graph.microsoft.com/v1.0/drives/${driveId}/root:/${pathInDrive}:/content`,
+    { headers: { Authorization: `Bearer ${appToken}` }, redirect: 'follow' }
+  );
+  if (fileResp.ok) return await fileResp.arrayBuffer();
+  const err = await fileResp.json().catch(()=>({}));
+  throw new Error(`Graph drives API: HTTP ${fileResp.status} — ${err?.error?.message || 'failed'}`);
+}
+
 async function downloadWithMicrosoftGraph(userId, shareUrl) {
   const creds = await getEffectiveCreds('microsoft');
-  const encoded = Buffer.from(shareUrl).toString('base64')
-    .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
-  const sharesUrl = `https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem/content`;
+
+  // Detect URL type: sharing link (/:x:/s/ or /_layouts/) vs direct file path
+  const isDirectPath = /\/sites\/[^/]+\/[^?]+\.[a-z]{2,5}(\?|$)/i.test(shareUrl) &&
+    !shareUrl.includes('/:') && !shareUrl.includes('_layouts/15/guestaccess');
 
   // Strategy 1: custom app credentials (client_credentials — no user login needed)
   if (creds.isCustom && creds.clientId && creds.clientSecret) {
-    try {
-      const appToken = await getMsAppToken(creds);
-      const resp = await fetch(sharesUrl, {
-        headers: { Authorization: `Bearer ${appToken}` },
-        redirect: 'follow',
-      });
-      if (resp.ok) return await resp.arrayBuffer();
-      // Parse the Graph error for a useful message
-      const errJson = await resp.json().catch(()=>null);
-      const graphMsg = errJson?.error?.message || `HTTP ${resp.status}`;
-      console.log('[fetch-url] App creds shares API failed:', resp.status, graphMsg);
-      // Surface the real error — NOT a generic NEEDS_AUTH
-      throw new Error(`SharePoint access failed (HTTP ${resp.status}): ${graphMsg}. In Azure Portal → App Registrations → API Permissions, make sure Files.Read.All (Application) is granted and admin-consented in addition to Sites.Read.All.`);
-    } catch(e) {
-      // If the error is one we threw above (real Graph error), re-throw it directly
-      if (!e.message.startsWith('App token failed') && !e.message.includes('NEEDS_AUTH')) {
-        throw e;
+    let appToken;
+    try { appToken = await getMsAppToken(creds); }
+    catch(e) { console.log('[fetch-url] App token error:', e.message); }
+
+    if (appToken) {
+      // 1a: For direct file URLs — use Graph drives path API
+      if (isDirectPath) {
+        try {
+          return await downloadViaSharePointPath(appToken, shareUrl);
+        } catch(e) {
+          console.log('[fetch-url] Graph path API failed:', e.message);
+          throw new Error(`SharePoint access failed: ${e.message}. Ensure Sites.Read.All and Files.Read.All application permissions are granted and admin-consented in Azure Portal.`);
+        }
       }
-      console.log('[fetch-url] App token error:', e.message);
+      // 1b: For sharing links — use the Graph Shares API
+      try {
+        const encoded = Buffer.from(shareUrl).toString('base64')
+          .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+        const resp = await fetch(`https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem/content`, {
+          headers: { Authorization: `Bearer ${appToken}` }, redirect: 'follow',
+        });
+        if (resp.ok) return await resp.arrayBuffer();
+        const errJson = await resp.json().catch(()=>null);
+        throw new Error(`SharePoint access failed (HTTP ${resp.status}): ${errJson?.error?.message||''}. Ensure Files.Read.All application permission is granted in Azure Portal.`);
+      } catch(e) {
+        if (e.message.startsWith('SharePoint access failed')) throw e;
+        console.log('[fetch-url] Shares API error:', e.message);
+      }
     }
-    // App token acquisition failed — fall through to user OAuth
+    // App token failed — fall through to user OAuth
   }
 
-  // No custom credentials — Strategy 2 only: user OAuth token
+  // Strategy 2: user OAuth token (from Connect Microsoft button)
   const token = await getValidAccessToken(userId, 'microsoft');
   if (!token) throw new Error('NEEDS_AUTH:microsoft');
 
-  const resp = await fetch(sharesUrl, {
-    headers: { Authorization: `Bearer ${token}` },
-    redirect: 'follow',
+  if (isDirectPath) {
+    // For direct URLs with user token, try the Graph path approach
+    try { return await downloadViaSharePointPath(token, shareUrl); } catch {}
+  }
+  const encoded = Buffer.from(shareUrl).toString('base64')
+    .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+  const resp = await fetch(`https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem/content`, {
+    headers: { Authorization: `Bearer ${token}` }, redirect: 'follow',
   });
   if (resp.status === 401) throw new Error('NEEDS_AUTH:microsoft');
   if (!resp.ok) throw new Error(`Microsoft Graph error: HTTP ${resp.status}`);
