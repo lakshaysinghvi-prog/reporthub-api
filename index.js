@@ -467,9 +467,16 @@ function parseXlsxBuffer(buf, sheetName, rangeOverride) {
       `Export only the required sheet, or upload the file directly instead of using a link.`
     );
   }
+  // Parse only the target sheet — other sheets stay as compressed bytes in memory.
+  // wb.SheetNames is still populated from the ZIP index so callers get the full list.
   let wb;
-  try { wb = XLSX.read(buf, { type: 'buffer', cellDates: true }); }
-  catch(e) { throw new Error('Could not parse file as Excel: ' + e.message); }
+  try {
+    wb = XLSX.read(buf, {
+      type: 'buffer',
+      cellDates: true,
+      sheets: sheetName || 0,  // sheet name string, or 0 = first sheet by index
+    });
+  } catch(e) { throw new Error('Could not parse file as Excel: ' + e.message); }
   const sheetNames = wb.SheetNames;
   const wsName = sheetName && wb.SheetNames.includes(sheetName) ? sheetName : wb.SheetNames[0];
   const ws = wb.Sheets[wsName];
