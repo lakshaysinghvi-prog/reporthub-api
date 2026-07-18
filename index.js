@@ -71,6 +71,42 @@ app.get('/health', (_, res) => res.json({
   env: { db: !!process.env.DATABASE_URL, jwt: !!process.env.JWT_SECRET }
 }));
 
+// Diagnostic: test what auth strategy would be used and whether app token can be obtained
+app.get('/api/debug/ms-auth', auth(['admin']), async (req, res) => {
+  const result = { strategy: null, appTokenOk: false, appTokenError: null, userTokenOk: false, tenantId: null };
+  try {
+    const creds = await getEffectiveCreds('microsoft');
+    result.hasCustomCreds = creds.isCustom;
+    result.tenantId = creds.tenantId || null;
+    result.hasClientId = !!creds.clientId;
+    result.hasClientSecret = !!creds.clientSecret;
+    if (creds.isCustom && creds.clientId && creds.clientSecret) {
+      result.strategy = 'custom_app_credentials';
+      try {
+        const tok = await getMsAppToken(creds);
+        result.appTokenOk = true;
+        // Quick sanity check: list sites
+        const testR = await fetch('https://graph.microsoft.com/v1.0/sites?search=*&$top=1', {
+          headers: { Authorization: 'Bearer ' + tok }
+        });
+        const testBody = await testR.json().catch(()=>({}));
+        result.graphSitesStatus = testR.status;
+        result.graphSitesOk = testR.ok;
+        if (!testR.ok) result.graphSitesError = testBody.error?.message || JSON.stringify(testBody);
+      } catch(e) {
+        result.appTokenError = e.message;
+      }
+    } else {
+      result.strategy = 'user_oauth_only';
+    }
+    const userToken = await getValidAccessToken(req.user.id, 'microsoft');
+    result.userTokenOk = !!userToken;
+    res.json(result);
+  } catch(e) {
+    res.status(500).json({ error: e.message, partial: result });
+  }
+});
+
 // ────────────────────────────────────────────────────────────────────────────────
 // ── OAUTH 2.0 ───────────────────────────────────────────────────────────────────
 // ────────────────────────────────────────────────────────────────────────────────
@@ -392,38 +428,48 @@ async function getMsAppToken(creds) {
 
 async function downloadWithMicrosoftGraph(userId, shareUrl) {
   const creds = await getEffectiveCreds('microsoft');
+  const encoded = Buffer.from(shareUrl).toString('base64')
+    .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+  const sharesUrl = `https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem/content`;
 
   // Strategy 1: custom app credentials (client_credentials — no user login needed)
-  // Try whenever custom credentials are saved, regardless of tenantId value.
-  // getMsAppToken will throw if the tenant/creds are invalid; the catch falls through.
   if (creds.isCustom && creds.clientId && creds.clientSecret) {
+    let appTokenErr = null;
     try {
       const appToken = await getMsAppToken(creds);
-      const encoded = Buffer.from(shareUrl).toString('base64')
-        .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
-      const apiUrl = `https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem/content`;
-      const resp = await fetch(apiUrl, {
+      const resp = await fetch(sharesUrl, {
         headers: { Authorization: `Bearer ${appToken}` },
         redirect: 'follow',
       });
       if (resp.ok) return await resp.arrayBuffer();
-      // 403 usually means missing Files.Read.All permission in addition to Sites.Read.All
       const errBody = await resp.text().catch(()=>'');
-      console.log('App token fetch returned', resp.status, errBody.slice(0,200), '— trying user token');
+      appTokenErr = `App credentials returned HTTP ${resp.status}: ${errBody.slice(0,300)}`;
+      console.log('[fetch-url] Strategy 1 failed:', appTokenErr);
     } catch(e) {
-      console.log('App token strategy failed:', e.message, '— falling back to user token');
+      appTokenErr = `App credentials error: ${e.message}`;
+      console.log('[fetch-url] Strategy 1 error:', appTokenErr);
     }
+    // If app creds are set but failed, skip user OAuth and surface the real error
+    // (user OAuth would give a misleading "expired" message)
+    const token = await getValidAccessToken(userId, 'microsoft');
+    if (!token) {
+      throw new Error(`NEEDS_AUTH:microsoft|${appTokenErr}`);
+    }
+    // Have a user token too — try it before giving up
+    const resp2 = await fetch(sharesUrl, {
+      headers: { Authorization: `Bearer ${token}` },
+      redirect: 'follow',
+    });
+    if (resp2.ok) return await resp2.arrayBuffer();
+    if (resp2.status === 401) throw new Error('NEEDS_AUTH:microsoft');
+    throw new Error(`Microsoft Graph error: HTTP ${resp2.status} (app creds also failed: ${appTokenErr})`);
   }
 
-  // Strategy 2: user OAuth token (from the Connect Microsoft button)
+  // No custom credentials — Strategy 2 only: user OAuth token
   const token = await getValidAccessToken(userId, 'microsoft');
   if (!token) throw new Error('NEEDS_AUTH:microsoft');
 
-  const encoded = Buffer.from(shareUrl).toString('base64')
-    .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
-  const apiUrl = `https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem/content`;
-
-  const resp = await fetch(apiUrl, {
+  const resp = await fetch(sharesUrl, {
     headers: { Authorization: `Bearer ${token}` },
     redirect: 'follow',
   });
@@ -565,8 +611,12 @@ app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), as
         return res.json({ ok: true, ...result, rowCount: result.rows.length });
       } catch(e) {
         if (e.message.startsWith('NEEDS_AUTH:')) {
-          return res.status(401).json({ error: 'needs_auth', provider: 'microsoft',
-            message: 'Connect your Microsoft account in the Upload tab to access OneDrive/SharePoint files.' });
+          // Extract the real app-creds error if present (format: NEEDS_AUTH:microsoft|<detail>)
+          const detail = e.message.includes('|') ? e.message.split('|').slice(1).join('|') : null;
+          const message = detail
+            ? `App credentials failed (${detail}). Connect your Microsoft account as a fallback.`
+            : 'Connect your Microsoft account in the Upload tab to access OneDrive/SharePoint files.';
+          return res.status(401).json({ error: 'needs_auth', provider: 'microsoft', message });
         }
         console.log('Graph API failed, trying public fallback:', e.message);
       }
