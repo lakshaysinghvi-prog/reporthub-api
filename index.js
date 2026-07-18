@@ -458,7 +458,14 @@ async function downloadWithGoogleDrive(userId, shareUrl) {
   return await resp.arrayBuffer();
 }
 
+const MAX_XLSX_BYTES = 25 * 1024 * 1024; // 25 MB — XLSX.read is ~5-10x memory; beyond this risks OOM
 function parseXlsxBuffer(buf, sheetName, rangeOverride) {
+  if (buf.byteLength > MAX_XLSX_BYTES) {
+    throw new Error(
+      `File is too large to process (${Math.round(buf.byteLength / 1024 / 1024)} MB). ` +
+      `Maximum is 25 MB. Please export only the required sheet or reduce the row count.`
+    );
+  }
   let wb;
   try { wb = XLSX.read(buf, { type: 'buffer', cellDates: true }); }
   catch(e) { throw new Error('Could not parse file as Excel: ' + e.message); }
@@ -512,7 +519,7 @@ function parseXlsxBuffer(buf, sheetName, rangeOverride) {
 }
 
 // ── Main fetch-url endpoint ─────────────────────────────────────────────────────
-app.post('/api/fetch-url', auth(['admin','user']), async (req, res) => {
+app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), async (req, res) => {
   const { url, sheetName, rangeOverride } = req.body;
   if (!url) return res.status(400).json({ error: 'url is required' });
   // For viewer role, use the admin's stored OAuth tokens
@@ -1118,152 +1125,6 @@ app.post('/api/reports/:id/refresh-url', auth(['admin']), async (req, res) => {
     } catch (e) { await client.query('ROLLBACK'); throw e; }
     finally { client.release(); }
   } catch (e) { res.status(500).json({ error: e.message }); }
-});
-
-// ── Proxy URL fetch — downloads Excel/CSV from any URL server-side ─────────────
-app.post('/api/fetch-url', auth(['admin','user']), async (req, res) => {
-  try {
-    const { url, sheetName } = req.body;
-    if (!url) return res.status(400).json({ error: 'url is required' });
-
-    let downloadUrl = url.trim();
-
-    // ── OneDrive / SharePoint — use the Sharing API for reliable download ───────
-    // Works for personal OneDrive (1drv.ms), OneDrive for Business, SharePoint
-    // Even "anyone can edit/view" links work without sign-in via this method
-    if (downloadUrl.includes('1drv.ms') || downloadUrl.includes('onedrive.live.com') ||
-        downloadUrl.includes('sharepoint.com') || downloadUrl.includes('my.sharepoint.com')) {
-      try {
-        // Encode share URL as base64url (OneDrive Sharing API spec)
-        const encoded = Buffer.from(downloadUrl).toString('base64')
-          .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-        const apiUrl = `https://api.onedrive.com/v1.0/shares/u!${encoded}/root/content`;
-        console.log('Using OneDrive API:', apiUrl);
-        const r0 = await fetch(apiUrl, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; ReportHub/2.0)' },
-          redirect: 'follow',
-        });
-        if (r0.ok) {
-          // Success — use this response directly
-          const ct = r0.headers.get('content-type') || '';
-          const buf0 = await r0.arrayBuffer();
-          let wb;
-          try { wb = XLSX.read(buf0, { type: 'buffer', cellDates: true }); }
-          catch(e) { return res.status(400).json({ error: 'Could not parse file: '+e.message }); }
-          const sheetNames0 = wb.SheetNames;
-          const wsName0 = sheetName && wb.SheetNames.includes(sheetName) ? sheetName : wb.SheetNames[0];
-          const ws0 = wb.Sheets[wsName0];
-          if (!ws0) return res.status(400).json({ error: `Sheet not found. Available: ${sheetNames0.join(', ')}` });
-          if (ws0['!ref']) {
-            const rr = XLSX.utils.decode_range(ws0['!ref']);
-            if (rr.e.r > 100000) { rr.e.r = 100000; ws0['!ref'] = XLSX.utils.encode_range(rr); }
-          }
-          const rows0 = XLSX.utils.sheet_to_json(ws0, { defval: null, cellDates: true, raw: true });
-          return res.json({ ok: true, rows: rows0, sheetNames: sheetNames0, rowCount: rows0.length });
-        }
-        // If API fails, fall through to direct download attempt
-        console.log('OneDrive API returned', r0.status, '— trying direct download');
-      } catch(e) {
-        console.log('OneDrive API error:', e.message, '— trying direct download');
-      }
-      // Fallback: try appending download=1
-      try {
-        const u = new URL(downloadUrl);
-        u.searchParams.set('download', '1');
-        downloadUrl = u.toString();
-      } catch(e) { /* url parse failed, use as-is */ }
-    }
-
-    // ── Dropbox ───────────────────────────────────────────────────────────────
-    if (downloadUrl.includes('dropbox.com')) {
-      const u = new URL(downloadUrl);
-      u.searchParams.set('dl', '1');
-      downloadUrl = u.toString();
-    }
-
-    // ── Google Drive share link ───────────────────────────────────────────────
-    if (downloadUrl.includes('drive.google.com')) {
-      const idMatch = downloadUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
-      if (idMatch) {
-        downloadUrl = `https://drive.google.com/uc?export=download&id=${idMatch[1]}&confirm=t`;
-      }
-    }
-
-    console.log('Fetching:', downloadUrl);
-
-    const resp = await fetch(downloadUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; ReportHub/2.0)',
-        'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/octet-stream,*/*',
-      },
-      redirect: 'follow',
-    });
-
-    if (!resp.ok) {
-      return res.status(400).json({
-        error: `Download failed: HTTP ${resp.status}. Make sure the file is shared as "Anyone with the link can view".`,
-        tip: resp.status === 401 || resp.status === 403
-          ? 'The file requires authentication. Share it publicly (Anyone with the link → View).'
-          : `HTTP ${resp.status} — check that the link is correct and the file is publicly shared.`
-      });
-    }
-
-    const contentType = resp.headers.get('content-type') || '';
-    const buf = await resp.arrayBuffer();
-
-    // Detect if we got an HTML page instead of a file (common with auth redirects)
-    if (contentType.includes('text/html')) {
-      const preview = Buffer.from(buf).toString('utf-8', 0, 500);
-      if (preview.includes('<html') || preview.includes('<!DOCTYPE')) {
-        return res.status(400).json({
-          error: 'Got a login/preview page instead of the file. The file needs to be shared as "Anyone with the link can view" without requiring sign-in.',
-          tip: 'OneDrive: open file → Share → Change to "Anyone with the link can view" → Copy link. Make sure it says "No sign-in required".'
-        });
-      }
-    }
-
-    let rows, sheetNames;
-
-    if (contentType.includes('csv') || url.endsWith('.csv') || url.endsWith('.txt')) {
-      const text = Buffer.from(buf).toString('utf-8');
-      const csvLines = text.split(/\r?\n/).filter(l => l.trim());
-      if (!csvLines.length) return res.status(400).json({ error: 'File appears to be empty.' });
-      // Simple CSV parse
-      const parseCSVLine = l => l.split(',').map(v => v.replace(/^"|"$/g, '').trim());
-      const headers = parseCSVLine(csvLines[0]);
-      rows = csvLines.slice(1).map(line => {
-        const vals = parseCSVLine(line);
-        const obj = {};
-        headers.forEach((h, i) => { if (h) obj[h] = vals[i] || ''; });
-        return obj;
-      });
-      sheetNames = ['CSV'];
-    } else {
-      let wb;
-      try {
-        wb = XLSX.read(buf, { type: 'buffer', cellDates: true });
-      } catch (xlsxErr) {
-        return res.status(400).json({
-          error: 'Could not parse the downloaded file as Excel. ' + xlsxErr.message,
-          tip: 'Make sure the link points to an .xlsx, .xls, or .csv file, not a preview page.'
-        });
-      }
-      sheetNames = wb.SheetNames;
-      const wsName = sheetName && wb.SheetNames.includes(sheetName) ? sheetName : wb.SheetNames[0];
-      const ws = wb.Sheets[wsName];
-      if (!ws) return res.status(400).json({ error: `Sheet "${wsName}" not found. Available: ${sheetNames.join(', ')}` });
-      if (ws['!ref']) {
-        const r = XLSX.utils.decode_range(ws['!ref']);
-        if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX.utils.encode_range(r); }
-      }
-      rows = XLSX.utils.sheet_to_json(ws, { defval: null, cellDates: true, raw: true });
-    }
-
-    res.json({ ok: true, rows, sheetNames, rowCount: rows.length });
-  } catch (e) {
-    console.error('fetch-url error:', e);
-    res.status(500).json({ error: e.message });
-  }
 });
 
 
