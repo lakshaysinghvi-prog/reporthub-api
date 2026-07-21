@@ -638,6 +638,23 @@ function parseXlsxBuffer(buf, sheetName, rangeOverride) {
     }
     ws['!ref'] = XLSX.utils.encode_range(r);
   }
+  // Rename blank/empty header cells to Col_XX so they're preserved in the output
+  // instead of becoming __EMPTY_N and being dropped by sanitizeRows. Blank headers
+  // are common when Excel columns have formatting/data but no label in row 1.
+  const renamedCols = [];
+  if (ws['!ref']) {
+    const refRange = XLSX.utils.decode_range(ws['!ref']);
+    for (let c = refRange.s.c; c <= refRange.e.c; c++) {
+      const addr = XLSX.utils.encode_cell({ r: refRange.s.r, c });
+      const cell = ws[addr];
+      if (!cell || cell.v === null || cell.v === undefined || String(cell.v).trim() === '') {
+        const colName = `Col_${XLSX.utils.encode_col(c)}`;
+        ws[addr] = { t: 's', v: colName, w: colName };
+        renamedCols.push(XLSX.utils.encode_col(c));
+      }
+    }
+  }
+
   // Check sheet dimensions before materialising rows — sheet_to_json is the real memory hog
   if (ws['!ref']) {
     const dim = XLSX.utils.decode_range(ws['!ref']);
@@ -686,7 +703,7 @@ function parseXlsxBuffer(buf, sheetName, rangeOverride) {
     return numCount / vals.length > 0.5;
   });
 
-  return { rows, fields, numFields, sheetNames };
+  return { rows, fields, numFields, sheetNames, renamedCols };
 }
 
 // ── Main fetch-url endpoint ─────────────────────────────────────────────────────
