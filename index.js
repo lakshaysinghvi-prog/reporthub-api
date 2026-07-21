@@ -329,12 +329,14 @@ app.get('/auth/google/callback', async (req, res) => {
 // ── Custom credentials management ─────────────────────────────────────────────
 app.get('/api/custom-credentials', auth(['admin','subadmin']), async (req, res) => {
   try {
-    const { rows } = await db.query('SELECT provider, client_id, tenant_id, updated_at FROM rh_custom_credentials');
+    const { rows } = await db.query('SELECT provider, client_id, client_secret, tenant_id, updated_at FROM rh_custom_credentials');
     const result = {};
     rows.forEach(r => {
       result[r.provider] = {
-        clientIdMasked: r.client_id ? r.client_id.slice(0,8)+'...'+r.client_id.slice(-4) : null,
-        tenantId: r.tenant_id, updatedAt: r.updated_at,
+        clientId: r.client_id || null,
+        clientSecret: r.client_secret || null,
+        tenantId: r.tenant_id || null,
+        updatedAt: r.updated_at,
       };
     });
     res.json(result);
