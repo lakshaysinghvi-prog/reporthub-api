@@ -624,14 +624,26 @@ function parseXlsxBuffer(buf, sheetName, rangeOverride) {
     catch(e) { /* invalid range — use sheet default */ }
   } else if (ws['!ref']) {
     const r = XLSX.utils.decode_range(ws['!ref']);
-    if (r.e.r > 100000) { r.e.r = 100000; ws['!ref'] = XLSX.utils.encode_range(r); }
+    // Cap rows
+    if (r.e.r > 100000) r.e.r = 100000;
+    // Trim cols to actual data extent — Excel files often have !ref spanning all 16384
+    // columns due to stray formatting, even when data only occupies a few dozen columns.
+    if (r.e.c - r.s.c >= 50) {
+      let maxCol = r.s.c;
+      for (const addr of Object.keys(ws)) {
+        if (addr[0] === '!') continue;
+        try { const cell = XLSX.utils.decode_cell(addr); if (cell.c > maxCol) maxCol = cell.c; } catch(_) {}
+      }
+      r.e.c = maxCol;
+    }
+    ws['!ref'] = XLSX.utils.encode_range(r);
   }
   // Check sheet dimensions before materialising rows — sheet_to_json is the real memory hog
   if (ws['!ref']) {
     const dim = XLSX.utils.decode_range(ws['!ref']);
-    const cells = (dim.e.r - dim.s.r) * (dim.e.c - dim.s.c + 1);
+    const cells = (dim.e.r - dim.s.r + 1) * (dim.e.c - dim.s.c + 1);
     if (cells > MAX_SHEET_CELLS) {
-      const rows = dim.e.r - dim.s.r;
+      const rows = dim.e.r - dim.s.r + 1;
       const cols = dim.e.c - dim.s.c + 1;
       throw new Error(
         `Sheet is too large to refresh via link (${rows.toLocaleString()} rows × ${cols} columns). ` +
