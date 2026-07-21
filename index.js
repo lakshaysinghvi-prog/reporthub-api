@@ -94,10 +94,11 @@ app.get('/api/debug/ms-auth', async (req, res) => {
         result.graphSitesStatus = testR.status;
         result.graphSitesOk = testR.ok;
         if (!testR.ok) result.graphSitesError = testBody.error?.message || JSON.stringify(testBody);
-        // Test 2: if a shareUrl is passed as query param, test it via the shares API
+        // Test 2: if a shareUrl is passed as query param, test metadata + content download
         if (req.query.url) {
           const encoded = Buffer.from(req.query.url).toString('base64')
             .replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+          // 2a: metadata
           const sharesUrl = `https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem`;
           const sharesR = await fetch(sharesUrl, { headers: { Authorization: 'Bearer ' + tok } });
           const sharesBody = await sharesR.json().catch(()=>({}));
@@ -105,6 +106,27 @@ app.get('/api/debug/ms-auth', async (req, res) => {
           result.sharesApiOk = sharesR.ok;
           result.sharesApiName = sharesBody.name || null;
           if (!sharesR.ok) result.sharesApiError = sharesBody.error?.message || JSON.stringify(sharesBody).slice(0,300);
+          // 2b: content download
+          try {
+            const contentR = await fetch(`https://graph.microsoft.com/v1.0/shares/u!${encoded}/driveItem/content`,
+              { headers: { Authorization: 'Bearer ' + tok }, redirect: 'follow' });
+            result.contentStatus = contentR.status;
+            result.contentOk = contentR.ok;
+            result.contentType = contentR.headers.get('content-type');
+            if (contentR.ok) {
+              const buf = await contentR.arrayBuffer();
+              result.contentBytes = buf.byteLength;
+            } else {
+              const errText = await contentR.text().catch(()=>'');
+              result.contentError = errText.slice(0, 300);
+            }
+          } catch(e2) { result.contentError = e2.message; }
+          // 2c: also test via Drives API (direct path approach)
+          try {
+            const buf2 = await downloadViaSharePointPath(tok, req.query.url);
+            result.drivesApiOk = true;
+            result.drivesApiBytes = buf2.byteLength;
+          } catch(e3) { result.drivesApiOk = false; result.drivesApiError = e3.message; }
         }
       } catch(e) {
         result.appTokenError = e.message;
