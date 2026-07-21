@@ -160,7 +160,9 @@ async function getEffectiveCreds(provider) {
       return { clientId:rows[0].client_id, clientSecret:rows[0].client_secret,
                tenantId:rows[0].tenant_id||'common', isCustom:true };
     }
-  } catch(e) {}
+  } catch(e) {
+    console.error('[getEffectiveCreds] DB error, falling back to env vars:', e.message);
+  }
   if (provider==='microsoft') return {
     clientId:process.env.MS_CLIENT_ID, clientSecret:process.env.MS_CLIENT_SECRET,
     tenantId:process.env.MS_TENANT_ID||'common', isCustom:false };
@@ -691,22 +693,28 @@ app.post('/api/fetch-url', auth(['admin','subadmin','subadmin_user','user']), as
   try {
     // ── Strategy 1: Microsoft Graph API (if connected) ──────────────────────────
     if (isMicrosoft) {
+      let msBuf;
       try {
-        const buf = await downloadWithMicrosoftGraph(userId, url);
-        const result = parseXlsxBuffer(buf, sheetName, rangeOverride);
-        return res.json({ ok: true, ...result, rowCount: result.rows.length });
+        msBuf = await downloadWithMicrosoftGraph(userId, url);
       } catch(e) {
         if (e.message.startsWith('NEEDS_AUTH:')) {
           return res.status(401).json({ error: 'needs_auth', provider: 'microsoft',
             message: 'Connect your Microsoft account in the Upload tab to access OneDrive/SharePoint files.' });
         }
-        // Real Graph error (e.g. 403 missing permissions) — return it directly.
-        // Don't try the public fallback; if app credentials are configured the file
-        // is almost certainly private and the public path will just return a login page.
         if (e.message.startsWith('SharePoint access failed')) {
           return res.status(400).json({ error: e.message });
         }
-        console.log('Graph API failed, trying public fallback:', e.message);
+        // Unexpected download error — log it and try public fallback only for non-credentialed fetches
+        console.log('[fetch-url] Microsoft download error (trying public fallback):', e.message);
+      }
+      if (msBuf) {
+        // Download succeeded — parse errors should surface as-is, not fall through to public URL
+        try {
+          const result = parseXlsxBuffer(msBuf, sheetName, rangeOverride);
+          return res.json({ ok: true, ...result, rowCount: result.rows.length });
+        } catch(parseErr) {
+          return res.status(400).json({ error: parseErr.message });
+        }
       }
     }
 
