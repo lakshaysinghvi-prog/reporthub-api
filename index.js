@@ -1007,7 +1007,8 @@ app.get('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) 
          CASE WHEN ra.user_id IS NOT NULL THEN true ELSE false END as has_access
        FROM rh_users u
        LEFT JOIN rh_report_access ra ON ra.report_id=$1 AND ra.user_id=u.id
-       WHERE u.role='user'
+       -- subadmin_user is gated by rh_report_access exactly like user (see the report-list query), so it must be grantable here too
+       WHERE u.role IN ('user','subadmin_user')
        ORDER BY u.username`, [req.params.id]);
     res.json(rows);
   } catch (e) { res.status(500).json({ error: e.message }); }
@@ -1197,35 +1198,6 @@ app.patch('/api/reports/:id/rows', auth(['admin','subadmin']), async (req, res) 
 });
 
 // ── Report access management ─────────────────────────────────────────────────────
-app.get('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
-  if (!await assertReportOwner(req, res)) return;
-  try {
-    const { rows } = await db.query(
-      `SELECT u.id, u.username, u.role,
-         EXISTS(SELECT 1 FROM rh_report_access ra WHERE ra.report_id=$1 AND ra.user_id=u.id) AS has_access
-       FROM rh_users u WHERE u.role='user' ORDER BY u.username`,
-      [req.params.id]
-    );
-    const { rows: acRows } = await db.query(
-      'SELECT COUNT(*) FROM rh_report_access WHERE report_id=$1', [req.params.id]);
-    res.json({ users: rows, isRestricted: parseInt(acRows[0].count) > 0 });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.put('/api/reports/:id/access', auth(['admin','subadmin']), async (req, res) => {
-  if (!await assertReportOwner(req, res)) return;
-  try {
-    const { userIds } = req.body;
-    await db.query('DELETE FROM rh_report_access WHERE report_id=$1', [req.params.id]);
-    if (userIds && userIds.length > 0) {
-      const vals = userIds.map((uid, i) => `($1,$${i+2})`).join(',');
-      await db.query(`INSERT INTO rh_report_access(report_id,user_id) VALUES ${vals}`,
-        [req.params.id, ...userIds]);
-    }
-    res.json({ ok: true, restricted: !!(userIds && userIds.length > 0) });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
 // Publish — always sets published=true, never touches other reports
 app.patch('/api/reports/:id/publish', auth(['admin','subadmin']), async (req, res) => {
   if (!await assertReportOwner(req, res)) return;
